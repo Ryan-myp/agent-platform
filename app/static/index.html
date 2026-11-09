@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f8f7" />
+    <meta name="description" content="通过对话生成并逐步确认脚本、图片、视频和音频内容。" />
+    <title>片场 · AI 内容创作台</title>
+    <link rel="stylesheet" href="/static/style.css?v=7" />
+    <script src="/static/app.js?v=7" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <a class="brand" href="/" aria-label="片场创作台首页">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+          <span><strong>片场</strong><small>多模态内容创作台</small></span>
+        </a>
+        <div class="sidebar-actions" role="group" aria-label="开始创作">
+          <button class="sidebar-action new-project" id="new-project" type="button"><span aria-hidden="true">＋</span> 新对话</button>
+          <button class="sidebar-action new-workflow" id="new-workflow" type="button"><span aria-hidden="true">▧</span> 创作流程</button>
+          <button class="sidebar-action records-action" id="open-records" type="button"><span aria-hidden="true">▤</span> 制作记录</button>
+        </div>
+        <div class="side-heading">最近对话</div>
+        <nav id="project-list" class="project-list" aria-label="最近对话"></nav>
+        <div class="sidebar-bottom">
+          <span class="connection-dot" aria-hidden="true"></span>
+          <span id="provider-status">正在连接工作台…</span>
+        </div>
+      </aside>
+
+      <main class="main-area">
+        <header class="topbar">
+          <div class="crumb"><span>工作台</span><span aria-hidden="true">/</span><strong id="top-title">新建对话</strong></div>
+          <div class="topbar-actions">
+            <label class="model-control" for="model-select">
+              <span>文本模型</span>
+              <select id="model-select" aria-label="选择文本模型" disabled></select>
+            </label>
+            <button class="button button-subtle topbar-button" id="open-models" type="button">模型配置</button>
+            <button class="button button-subtle topbar-button" id="view-toggle" type="button" disabled hidden>查看工作流</button>
+          </div>
+        </header>
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+        <section id="workspace" class="workspace" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <dialog id="models-dialog" class="models-dialog" aria-labelledby="models-title">
+      <section class="models-window">
+        <header class="chat-header">
+          <div><p class="section-kicker">供应商与模型</p><h2 id="models-title">模型配置</h2></div>
+          <div class="models-header-actions">
+            <button class="button button-primary" id="add-model" type="button">添加模型</button>
+            <button class="dialog-close" id="close-models" type="button" aria-label="关闭模型配置">×</button>
+          </div>
+        </header>
+        <p class="models-help">可添加、编辑或删除模型，并设置默认模型。API Key 可直接在此填写；密钥单独保存在本机受保护的凭据文件中，不写入模型目录或数据库。配置编辑器会显示已保存的 Key。</p>
+        <div id="model-editor-host"></div>
+        <p id="model-config-status" class="model-config-status" role="status" aria-live="polite"></p>
+        <div id="model-profiles" class="model-profiles"></div>
+      </section>
+    </dialog>
+
+    <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+      <section class="confirm-window">
+        <p class="section-kicker">确认操作</p>
+        <h2 id="confirm-title">确认操作</h2>
+        <p id="confirm-message" class="confirm-dialog-message">请选择是否继续。</p>
+        <div class="confirm-dialog-actions">
+          <button class="button button-subtle" id="confirm-cancel" type="button">取消</button>
+          <button class="button button-primary" id="confirm-accept" type="button">确认</button>
+        </div>
+      </section>
+    </dialog>
+  </body>
+</html>

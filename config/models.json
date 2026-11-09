@@ -1,0 +1,117 @@
+{
+  "defaults": {
+    "text": "agnes-text",
+    "image": "agnes-image",
+    "video": "agnes-video",
+    "audio": "openai-audio-tts"
+  },
+  "models": [
+    {
+      "id": "agnes-text",
+      "name": "Agnes 2.5 Flash",
+      "modality": "text",
+      "adapter": "openai_compatible",
+      "model_id": "agnes-2.5-flash",
+      "base_url": "https://apihub.agnes-ai.com/v1",
+      "api_key_env": "AGNES_API_KEY",
+      "params": {
+        "max_tokens": 3000
+      }
+    },
+    {
+      "id": "claude-sonnet",
+      "name": "Claude Sonnet",
+      "modality": "text",
+      "adapter": "anthropic",
+      "model_id": "claude-sonnet-4-5",
+      "base_url": "",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "params": {
+        "max_tokens": 3000
+      }
+    },
+    {
+      "id": "openai-text",
+      "name": "OpenAI GPT-4.1 mini",
+      "modality": "text",
+      "adapter": "openai_compatible",
+      "model_id": "gpt-4.1-mini",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "params": {
+        "max_tokens": 3000
+      }
+    },
+    {
+      "id": "agnes-image",
+      "name": "Agnes Image 2.5 Flash",
+      "modality": "image",
+      "adapter": "agnes_image",
+      "model_id": "agnes-image-2.5-flash",
+      "base_url": "https://apihub.agnes-ai.com/v1",
+      "api_key_env": "AGNES_API_KEY",
+      "params": {
+        "size": "2K",
+        "ratio": "9:16",
+        "extra_body": {
+          "response_format": "url"
+        }
+      }
+    },
+    {
+      "id": "openai-image",
+      "name": "OpenAI GPT Image 1",
+      "modality": "image",
+      "adapter": "openai_images",
+      "model_id": "gpt-image-1",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "params": {
+        "size": "1024x1536",
+        "quality": "medium"
+      }
+    },
+    {
+      "id": "agnes-video",
+      "name": "Agnes Video 2.5 Flash",
+      "modality": "video",
+      "adapter": "agnes_video",
+      "model_id": "agnes-video-2.5-flash",
+      "base_url": "https://apihub.agnes-ai.com/v1",
+      "api_key_env": "AGNES_API_KEY",
+      "params": {
+        "mode": "text",
+        "seconds": "5",
+        "size": "720P",
+        "aspect_ratio": "9:16",
+        "timeout_seconds": 300
+      }
+    },
+    {
+      "id": "openai-audio-tts",
+      "name": "OpenAI GPT-4o mini TTS",
+      "modality": "audio",
+      "adapter": "openai_audio",
+      "model_id": "gpt-4o-mini-tts",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "params": {
+        "operation": "speech",
+        "voice": "alloy",
+        "format": "mp3"
+      }
+    },
+    {
+      "id": "openai-audio-transcription",
+      "name": "OpenAI GPT-4o mini Transcribe",
+      "modality": "audio",
+      "adapter": "openai_audio",
+      "model_id": "gpt-4o-mini-transcribe",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "params": {
+        "operation": "transcription"
+      }
+    }
+  ]
+}

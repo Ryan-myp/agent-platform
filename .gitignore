@@ -1,0 +1,10 @@
+.idea/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.DS_Store
+# Local project database, API credentials, and generated media
+data/
+qa/captures/
