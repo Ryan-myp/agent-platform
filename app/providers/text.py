@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -188,7 +189,25 @@ class AnthropicTextProvider:
                 continue
             blocks: list[dict[str, Any]] = []
             content = item.get("content")
-            if content:
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "text" and part.get("text"):
+                        blocks.append({"type": "text", "text": str(part["text"])})
+                    elif part.get("type") == "image_url":
+                        image_url = part.get("image_url", {}).get("url", "")
+                        match = re.fullmatch(r"data:(image/(?:jpeg|png|gif|webp));base64,(.+)", image_url)
+                        if match:
+                            blocks.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": match.group(1),
+                                    "data": match.group(2),
+                                },
+                            })
+            elif content:
                 blocks.append({"type": "text", "text": str(content)})
             for call in item.get("tool_calls", []) or []:
                 function = call.get("function", {})

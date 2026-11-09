@@ -29,6 +29,10 @@ class ModelUpdate(BaseModel):
     model: str
 
 
+class ProjectTitleUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+
+
 class ModelProfileConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -55,5 +59,6 @@ class ContentUpdate(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=10000)
+    message: str = Field(default="", max_length=10000)
     model: str | None = None
+    attachment_ids: list[str] = Field(default_factory=list, max_length=8)

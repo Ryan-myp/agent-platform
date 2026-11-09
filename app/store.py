@@ -59,6 +59,18 @@ class ProjectStore:
                 "ON chat_messages(project_id, created_at DESC, id DESC)"
             )
             connection.execute(
+                """CREATE TABLE IF NOT EXISTS chat_attachments (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_attachments_project_created "
+                "ON chat_attachments(project_id, created_at)"
+            )
+            connection.execute(
                 """CREATE TABLE IF NOT EXISTS video_jobs (
                     id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
@@ -246,6 +258,41 @@ class ProjectStore:
                 ),
             )
         return message
+
+    def save_chat_attachment(self, attachment: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO chat_attachments (id, project_id, created_at, payload) VALUES (?, ?, ?, ?)",
+                (
+                    attachment["id"],
+                    attachment["project_id"],
+                    attachment["created_at"],
+                    json.dumps(attachment, ensure_ascii=False),
+                ),
+            )
+        return attachment
+
+    def get_chat_attachment(self, attachment_id: str, project_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM chat_attachments WHERE id = ? AND project_id = ?",
+                (attachment_id, project_id),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def delete_chat_attachment(self, attachment_id: str, project_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM chat_attachments WHERE id = ? AND project_id = ?",
+                (attachment_id, project_id),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "DELETE FROM chat_attachments WHERE id = ? AND project_id = ?",
+                (attachment_id, project_id),
+            )
+        return json.loads(row["payload"])
 
     def chat_history(self, project_id: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._connection() as connection:

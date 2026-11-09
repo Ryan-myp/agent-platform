@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#f5f8f7" />
     <meta name="description" content="通过对话生成并逐步确认脚本、图片、视频和音频内容。" />
     <title>片场 · AI 内容创作台</title>
-    <link rel="stylesheet" href="/static/style.css?v=11" />
-    <script src="/static/app.js?v=12" defer></script>
+    <link rel="stylesheet" href="/static/style.css?v=13" />
+    <script src="/static/app.js?v=14" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -60,6 +60,20 @@
         <p id="model-config-status" class="model-config-status" role="status" aria-live="polite"></p>
         <div id="model-profiles" class="model-profiles"></div>
       </section>
+    </dialog>
+
+    <dialog id="rename-dialog" class="confirm-dialog" aria-labelledby="rename-title">
+      <form id="rename-form" class="confirm-window">
+        <p class="section-kicker">对话管理</p>
+        <h2 id="rename-title">重命名对话</h2>
+        <label class="rename-label" for="rename-input">名称</label>
+        <input id="rename-input" name="title" type="text" maxlength="100" required />
+        <p id="rename-error" class="rename-error" role="status" aria-live="polite"></p>
+        <div class="confirm-dialog-actions">
+          <button class="button button-subtle" id="rename-cancel" type="button">取消</button>
+          <button class="button button-primary" type="submit">保存名称</button>
+        </div>
+      </form>
     </dialog>
 
     <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">

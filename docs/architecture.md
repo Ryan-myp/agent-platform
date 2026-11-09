@@ -6,24 +6,26 @@
 
 ## 模块
 
-- `app/services/workflow.py`：项目与阶段状态机；草稿可编辑，只有确认当前步骤后才进入下一步。明确标注信息不足或无法继续的草稿不能确认，下游生成会预检已确认内容，并在发现阻塞说明时停止且不调用模型。创建时按 `mode=chat|workflow` 区分普通会话和结构化流程。
-- `app/services/chat.py`：会话上下文整理和工具调用循环。普通对话无预设 brief，工作流对话包含项目 brief 和已确认阶段；对话保存在 SQLite，媒体工具仅在用户明确提出生成要求时提供给文本模型。
+- `app/services/workflow.py`：项目与阶段状态机；草稿可编辑，只有确认当前步骤后才进入下一步。明确标注信息不足或无法继续的草稿不能确认，下游生成会预检已确认内容，并在发现阻塞说明时停止且不调用模型。创建时按 `mode=chat|workflow` 区分普通会话和结构化流程，并提供标题重命名及只归档、不删除数据的最近对话移除操作。
+- `app/services/chat.py`：会话上下文整理和工具调用循环。普通对话无预设 brief，工作流对话包含项目 brief 和已确认阶段；对话保存在 SQLite，媒体工具在执行前先复述操作并等待明确确认。图片和视频画面作为视觉输入、文档文本作为文本输入；附件按项目归属校验，历史上下文限制为最近 8 个且合计最多 40 MB。
+- `app/services/attachments.py`：限制附件类型、数量和大小；在本机提取文本/PDF/DOCX 内容，视频最多分析 6 帧且不含声音。视频帧在进程内做有界 LRU 缓存，避免同一附件在长对话中反复解码。
 - `app/stages.py`：`script → prompt → storyboard → scenes → video` 的阶段顺序、公共格式要求和按创作类型区分的提示词要求。
 - `config/models.json`、`app/providers/catalog.py`：按 text/image/video/audio 声明模型 ID、厂商适配器、端点、参数、兼容用 API Key 环境变量名和模态默认值；`PUT /api/config/models` 校验、原子持久化并热更新模型目录，公共配置接口不返回 Key。
 - `app/providers/credentials.py`：将 API Key 独立保存到数据库同目录的 `model-credentials.json`，使用临时文件原子替换并尽量设置 `0600` 权限；凭据不进入模型目录或项目数据库。
 - `app/providers/text.py`：统一文本 Provider 协议、OpenAI-compatible Chat Completions / 工具调用适配器及 Anthropic Claude SDK 适配器。
 - `app/providers/media.py`：图像、视频、音频 Provider 和本地媒体资源保存。当前包括 Agnes 图像、拆分提交与查询的 Agnes 视频适配器，以及 OpenAI-compatible 语音/转写适配器。
 - `app/skills/loader.py`：扫描本地 `skills/<skill-id>/SKILL.md`，按创作类型与阶段加载 Markdown，并仅内联 frontmatter 显式列出的同目录参考文件；缺少 `tracks` 的旧 Skills 仅按营销路线加载；不执行 Skill 文件代码。
-- `app/store.py`：SQLite 项目、聊天消息和逐镜视频任务持久化；聊天记录按 `(project_id, created_at, id)` 建索引并用 keyset 游标分页，避免长对话每次扫描/返回全部消息；项目状态和新视频任务在同一事务写入。后续可替换为 Postgres 实现。
-- `app/static/`：无构建步骤的工作台 UI，含独立的“新对话”和“创作流程”入口、原生 `<dialog>` 模型配置管理、逐步确认界面。聊天首屏只读最近 10 条，用户可按需向上加载更早记录；分页插入后保留当前阅读位置。聊天发送采用乐观用户消息和 SSE 文本增量更新；助手回复和工作流只读内容安全渲染 Markdown，用户消息保持纯文本。
+- `app/store.py`：SQLite 项目、聊天消息、附件元数据和逐镜视频任务持久化；附件媒体文件保存到本机媒体目录。聊天记录按 `(project_id, created_at, id)` 建索引并用 keyset 游标分页，避免长对话每次扫描/返回全部消息；项目状态和新视频任务在同一事务写入。后续可替换为 Postgres 实现。
+- `app/static/`：无构建步骤的工作台 UI，含独立的“新对话”和“创作流程”入口、对话附件选择/预览/拖放、最近对话重命名与移除、原生 `<dialog>` 模型配置管理和逐步确认界面。聊天首屏只读最近 10 条，用户可按需向上加载更早记录；分页插入后保留当前阅读位置。聊天发送采用乐观用户消息和 SSE 文本增量更新；助手回复和工作流只读内容安全渲染 Markdown，用户消息保持纯文本。
 
 ## 对话和媒体流程
 
 1. 新对话首次发送消息前由前端调用 `POST /api/chat/sessions` 创建 `mode=chat` 会话；它不要求 brief，首条用户消息会成为会话标题。创作流程由 `POST /api/projects` 创建 `mode=workflow` 项目。打开对话时前端调用 `GET /api/projects/{id}/chat/history?limit=10` 读取最近记录；`before` 游标可取前一页，消息按时间正序返回。随后两种模式都通过 `POST /api/projects/{id}/chat/stream` 发送消息：用户消息先在界面显示，服务通过 SSE 返回状态和文本增量；普通聊天使用不含 brief 的上下文，工作流会话使用项目 brief 与已确认阶段内容。兼容的 `GET/POST /api/projects/{id}/chat` 接口仍保留。
-2. 文本模型可调用图片、视频、语音生成工具；工具结果以附件形式保存并显示在对话里。没有 Provider 成功结果时，不得声称媒体已生成。
-3. 图像和音频请求当前在聊天 HTTP 请求中同步完成。结构化工作流的逐镜视频任务写入 SQLite 后由单进程后台 Worker 提交和轮询；入队接口返回 HTTP 202，项目状态包含本地任务 ID、供应商任务 ID和状态，前端定时刷新。轮询失败采用有上限的退避重试。服务重启后可按已持久化的供应商任务 ID继续轮询；若进程在提交期间中断或响应无法确认，任务会标为“提交结果待核对”，不会自动重发，必须由用户核对供应商任务后明确确认重试。旧式 Provider 和聊天内媒体工具仍保持同步兼容。
-4. Agnes Video 2.5 Flash 单次支持 4–12 秒；当前没有多段视频拼接。超出单次范围的项目会收到错误，不会被伪装成完整成片。已知 `video_queue_full` 错误会以可操作提示保留供应商请求 ID；平台不会自动重复提交。
-5. `scenes` 阶段目前产出逐镜图片提示词，不自动生成场景图片。需要扩展时，可增加 scene-level image job，并将确认过的画面作为视频参考输入。
+2. `POST /api/projects/{id}/chat/attachments` 将附件保存到本机并返回项目绑定的 ID；消息通过 `attachment_ids` 引用，服务验证项目归属。图片/视频视觉输入需所选文本模型支持视觉能力；PDF/DOCX/TXT 等内容先在本机提取文本。每条消息最多 8 个附件、单个 20 MB、合计 40 MB；视频最多分析 6 帧，不解析声音。历史记录每轮最多选取最近 8 个、合计 40 MB 的附件，更早附件会提示重新上传。
+3. 文本模型可请求图片、视频、语音生成工具；服务先向用户展示生成内容并等待明确确认，确认前不调用媒体 Provider。工具结果以附件形式保存并显示在对话里。没有 Provider 成功结果时，不得声称媒体已生成。
+4. 图像和音频请求当前在聊天 HTTP 请求中同步完成。结构化工作流的逐镜视频任务写入 SQLite 后由单进程后台 Worker 提交和轮询；入队接口返回 HTTP 202，项目状态包含本地任务 ID、供应商任务 ID和状态，前端定时刷新。轮询失败采用有上限的退避重试。服务重启后可按已持久化的供应商任务 ID继续轮询；若进程在提交期间中断或响应无法确认，任务会标为“提交结果待核对”，不会自动重发，必须由用户核对供应商任务后明确确认重试。旧式 Provider 和聊天内媒体工具仍保持同步兼容。
+5. Agnes Video 2.5 Flash 单次支持 4–12 秒；当前没有多段视频拼接。超出单次范围的项目会收到错误，不会被伪装成完整成片。已知 `video_queue_full` 错误会以可操作提示保留供应商请求 ID；平台不会自动重复提交。
+6. `scenes` 阶段目前产出逐镜图片提示词，不自动生成场景图片。需要扩展时，可增加 scene-level image job，并将确认过的画面作为视频参考输入。
 
 ## 模式与凭据
 

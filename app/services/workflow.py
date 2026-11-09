@@ -105,7 +105,25 @@ class WorkflowService:
             },
             "created_at": created,
             "updated_at": created,
+            "archived": False,
         }
+        return self.store.save(project)
+
+    def rename_project(self, project_id: str, title: str) -> dict:
+        project = self.get_project(project_id)
+        clean_title = str(title or "").strip()
+        if not clean_title:
+            raise WorkflowError("对话名称不能为空。", 422)
+        if len(clean_title) > 100:
+            raise WorkflowError("对话名称不能超过 100 个字符。", 422)
+        project["title"] = clean_title
+        project["updated_at"] = now_iso()
+        return self.store.save(project)
+
+    def archive_project(self, project_id: str) -> dict:
+        project = self.get_project(project_id)
+        project["archived"] = True
+        project["updated_at"] = now_iso()
         return self.store.save(project)
 
     def get_project(self, project_id: str) -> dict:

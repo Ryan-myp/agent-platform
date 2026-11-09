@@ -28,10 +28,16 @@ from app.models import (
     ModelCatalogUpdate,
     ModelUpdate,
     ProjectCreate,
+    ProjectTitleUpdate,
 )
 from app.providers.media import AssetStore, ImageProvider, MediaProviderError, VideoProvider, create_audio_provider
 from app.providers.catalog import MODALITIES, SUPPORTED_ADAPTERS, ModelCatalog, ModelProfile
 from app.providers.credentials import ModelCredentialStore
+from app.services.attachments import (
+    MAX_TOTAL_ATTACHMENT_BYTES,
+    ChatAttachmentError,
+    ChatAttachmentService,
+)
 from app.services.chat import ChatService
 from app.services.workflow import WorkflowError, WorkflowService
 from app.services.video_jobs import VideoJobWorker
@@ -154,7 +160,8 @@ def create_app(
     workflow = WorkflowService(store, current_settings, skill_loader, video_provider, image_provider, assets)
     video_job_worker = VideoJobWorker(workflow, store)
     workflow.video_job_worker = video_job_worker
-    chat = ChatService(store, current_settings, assets)
+    chat_attachments = ChatAttachmentService(store, assets)
+    chat = ChatService(store, current_settings, assets, chat_attachments)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -172,6 +179,7 @@ def create_app(
     )
     application.state.workflow = workflow
     application.state.chat = chat
+    application.state.chat_attachments = chat_attachments
     application.state.assets = assets
     application.state.model_credentials = credential_store
     application.state.video_job_worker = video_job_worker
@@ -322,6 +330,14 @@ def create_app(
     def get_project(project_id: str) -> dict:
         return run(workflow.get_project, project_id)
 
+    @application.put("/api/projects/{project_id}/title")
+    def rename_project(project_id: str, payload: ProjectTitleUpdate) -> dict:
+        return run(workflow.rename_project, project_id, payload.title)
+
+    @application.post("/api/projects/{project_id}/archive")
+    def archive_project(project_id: str) -> dict:
+        return run(workflow.archive_project, project_id)
+
     @application.post("/api/projects/{project_id}/model")
     def update_model(project_id: str, payload: ModelUpdate) -> dict:
         return run(workflow.set_model, project_id, payload.model)
@@ -384,13 +400,49 @@ def create_app(
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
+    @application.post("/api/projects/{project_id}/chat/attachments", status_code=201)
+    async def upload_chat_attachments(
+        project_id: str,
+        files: list[UploadFile] = File(...),
+    ) -> list[dict]:
+        uploaded = []
+
+        def discard_partial_uploads() -> None:
+            for item in uploaded:
+                try:
+                    chat_attachments.discard_upload(project_id, item["id"])
+                except Exception:
+                    pass
+
+        try:
+            workflow.get_project(project_id)
+            if not files or len(files) > 8:
+                raise ChatAttachmentError("一次最多上传 8 个附件。")
+            total_size = 0
+            for file in files:
+                content = await file.read(20 * 1024 * 1024 + 1)
+                total_size += len(content)
+                if total_size > MAX_TOTAL_ATTACHMENT_BYTES:
+                    raise ChatAttachmentError("单条消息的附件总大小不能超过 40 MB。")
+                uploaded.append(chat_attachments.upload(project_id, file.filename, content))
+            return uploaded
+        except WorkflowError as error:
+            discard_partial_uploads()
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        except ChatAttachmentError as error:
+            discard_partial_uploads()
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except Exception:
+            discard_partial_uploads()
+            raise
+
     @application.post("/api/projects/{project_id}/chat")
     def send_chat(project_id: str, payload: ChatRequest) -> list[dict]:
         try:
-            return chat.send(project_id, payload.message, payload.model)
+            return chat.send(project_id, payload.message, payload.model, attachment_ids=payload.attachment_ids)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
-        except ValueError as error:
+        except (ValueError, ChatAttachmentError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         except RuntimeError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
@@ -406,6 +458,7 @@ def create_app(
                     project_id,
                     payload.message,
                     payload.model,
+                    attachment_ids=payload.attachment_ids,
                     on_event=events.put,
                 )
                 events.put({

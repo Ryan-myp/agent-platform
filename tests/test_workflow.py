@@ -113,8 +113,8 @@ def test_home_page_avoids_stale_markup_and_loads_versioned_assets(tmp_path):
     assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate"
     assert 'id="open-records"' in response.text
     assert 'id="confirm-dialog"' in response.text
-    assert "/static/app.js?v=11" in response.text
-    assert "/static/style.css?v=10" in response.text
+    assert "/static/app.js?v=14" in response.text
+    assert "/static/style.css?v=13" in response.text
 
 
 def test_create_generate_edit_and_approve_advances_one_stage(tmp_path):
@@ -1003,10 +1003,148 @@ def test_chat_image_tool_creates_an_attachment(monkeypatch, tmp_path):
         json={"message": "请生成一张咖啡产品海报"},
     )
     assert response.status_code == 200
+    assert text_provider.calls == 1
+    assert "可能产生供应商费用" in response.json()[-1]["content"]
+
+    response = client.post(
+        f"/api/projects/{project['id']}/chat",
+        json={"message": "确认生成"},
+    )
+    assert response.status_code == 200
     assistant = [message for message in response.json() if message["role"] == "assistant" and not message.get("internal")]
     assert assistant[-1]["attachments"] == [{
         "type": "image", "url": "/media/generated.png", "model": "Agnes Image 2.5 Flash",
     }]
+
+
+def test_anthropic_text_adapter_converts_chat_image_parts():
+    from app.providers.text import AnthropicTextProvider
+
+    messages = AnthropicTextProvider._convert_messages([{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "请描述这张图片"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+        ],
+    }])
+
+    assert messages == [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "请描述这张图片"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="},
+            },
+        ],
+    }]
+
+
+def test_chat_uploads_and_passes_image_and_document_content_to_text_model(monkeypatch, tmp_path):
+    import app.services.chat as chat_module
+
+    captured = {}
+
+    class FakeTextProvider:
+        def chat(self, *, messages, tools=None):
+            captured["messages"] = messages
+            return ChatResult(text="我已读取图片和文件内容。")
+
+    monkeypatch.setattr(chat_module, "create_text_provider", lambda profile, key: FakeTextProvider())
+    client = make_client(tmp_path, api_keys={"AGNES_API_KEY": "test-key"})
+    project = client.post("/api/chat/sessions", json={}).json()
+    files = [
+        ("files", ("reference.png", b"\x89PNG\r\n\x1a\n" + b"image-data", "image/png")),
+        ("files", ("brief.txt", "产品特点：轻盈、耐用".encode("utf-8"), "text/plain")),
+    ]
+    uploaded = client.post(f"/api/projects/{project['id']}/chat/attachments", files=files)
+    assert uploaded.status_code == 201, uploaded.text
+    attachments = uploaded.json()
+    assert [item["filename"] for item in attachments] == ["reference.png", "brief.txt"]
+
+    response = client.post(
+        f"/api/projects/{project['id']}/chat",
+        json={"message": "结合图片和文件，概括产品信息", "attachment_ids": [item["id"] for item in attachments]},
+    )
+    assert response.status_code == 200, response.text
+    user_content = next(
+        item["content"] for item in captured["messages"]
+        if item["role"] == "user" and isinstance(item["content"], list)
+    )
+    assert any(part.get("type") == "image_url" for part in user_content)
+    assert any("轻盈、耐用" in part.get("text", "") for part in user_content)
+    saved_user = next(item for item in response.json() if item["role"] == "user")
+    assert [item["id"] for item in saved_user["attachments"]] == [item["id"] for item in attachments]
+
+
+def test_chat_context_only_includes_the_most_recent_eight_attachments(tmp_path):
+    client = make_client(tmp_path, api_keys={"AGNES_API_KEY": "test-key"})
+    project = client.post("/api/chat/sessions", json={}).json()
+    history = []
+    for index in range(9):
+        filename = f"reference-{index}.txt"
+        response = client.post(
+            f"/api/projects/{project['id']}/chat/attachments",
+            files={"files": (filename, f"content-{index}".encode(), "text/plain")},
+        )
+        assert response.status_code == 201, response.text
+        history.append({
+            "role": "user",
+            "content": f"message-{index}",
+            "attachments": response.json(),
+        })
+
+    messages = client.app.state.chat._provider_messages(project["id"], history)
+
+    assert "reference-0.txt" in messages[0]["content"][-1]["text"]
+    assert "content-0" not in str(messages[0]["content"])
+    assert any("content-8" in str(message["content"]) for message in messages[1:])
+
+
+def test_video_attachment_frames_are_cached_between_chat_turns(monkeypatch, tmp_path):
+    from app.services.attachments import ChatAttachmentService
+    from app.store import ProjectStore
+
+    assets = AssetStore(tmp_path / "media")
+    store = ProjectStore(tmp_path / "attachments.db")
+    service = ChatAttachmentService(store, assets)
+    asset_url = assets.save(b"sample video", ".mp4")
+    calls = []
+
+    def extract_frames(path):
+        calls.append(path)
+        return [(0.5, b"frame-data")], 1.0, False
+
+    monkeypatch.setattr(service, "_video_frames", extract_frames)
+    attachment = {
+        "id": "video-attachment",
+        "type": "video",
+        "filename": "clip.mp4",
+        "storage_key": asset_url.rsplit("/", 1)[-1],
+    }
+
+    service.provider_parts(attachment)
+    service.provider_parts(attachment)
+
+    assert len(calls) == 1
+
+
+def test_recent_conversation_rename_and_archive_preserve_project(tmp_path):
+    client = make_client(tmp_path)
+    project = new_project(client).json()
+
+    renamed = client.put(
+        f"/api/projects/{project['id']}/title", json={"title": "参考素材讨论"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["title"] == "参考素材讨论"
+
+    archived = client.post(f"/api/projects/{project['id']}/archive")
+    assert archived.status_code == 200
+    assert archived.json()["archived"] is True
+    assert client.get(f"/api/projects/{project['id']}").json()["title"] == "参考素材讨论"
+    listed = client.get("/api/projects").json()
+    assert any(item["id"] == project["id"] and item["archived"] for item in listed)
 
 
 def test_config_reports_media_provider_credentials_without_exposing_them(tmp_path):

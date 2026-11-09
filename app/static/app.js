@@ -13,6 +13,8 @@ const state = {
   chatHistoryCursor: null,
   chatLoadingOlder: false,
   chatSending: false,
+  pendingUploads: [],
+  renameProjectId: null,
   recordFilter: "all",
   viewMode: "new",
 };
@@ -23,6 +25,7 @@ const projectList = document.querySelector("#project-list");
 const modelSelect = document.querySelector("#model-select");
 const modelsDialog = document.querySelector("#models-dialog");
 const confirmDialog = document.querySelector("#confirm-dialog");
+const renameDialog = document.querySelector("#rename-dialog");
 
 function escapeHTML(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -222,6 +225,13 @@ function showNotice(message, isError = false) {
   notice.classList.toggle("notice-error", isError);
 }
 
+function showChatStatus(message, isError = false) {
+  const status = document.querySelector("#chat-status");
+  if (!status) return;
+  status.textContent = message || "";
+  status.classList.toggle("is-error", isError);
+}
+
 function confirmInApp({ title, message, confirmLabel = "确认", cancelLabel = "取消" }) {
   if (!confirmDialog || confirmDialog.open) return Promise.resolve(false);
   const titleElement = document.querySelector("#confirm-title");
@@ -278,17 +288,88 @@ function safeMediaUrl(value) {
   }
 }
 
+function chatAttachmentKind(file) {
+  const extension = String(file.name || "").split(".").pop().toLowerCase();
+  if (file.type?.startsWith("image/") || ["jpg", "jpeg", "png", "webp", "gif"].includes(extension)) return "image";
+  if (file.type?.startsWith("video/") || ["mp4", "m4v", "mov", "webm"].includes(extension)) return "video";
+  return "file";
+}
+
+function formatFileSize(size) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(0)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function clearPendingUploads() {
+  releaseUploadPreviews(state.pendingUploads);
+  state.pendingUploads = [];
+}
+
+function renderPendingAttachments() {
+  const tray = document.querySelector("#chat-pending-attachments");
+  if (!tray) return;
+  tray.hidden = state.pendingUploads.length === 0;
+  tray.innerHTML = state.pendingUploads.map((item, index) => {
+    const preview = item.kind === "image"
+      ? `<img src="${escapeHTML(item.previewUrl)}" alt="${escapeHTML(item.name)}" />`
+      : item.kind === "video"
+        ? `<video src="${escapeHTML(item.previewUrl)}" muted preload="metadata" aria-label="${escapeHTML(item.name)}"></video>`
+        : `<span class="chat-file-icon" aria-hidden="true">▤</span>`;
+    return `<div class="chat-pending-file">${preview}<span><strong>${escapeHTML(item.name)}</strong><small>${formatFileSize(item.file.size)}</small></span>
+      <button type="button" data-remove-pending="${index}" aria-label="移除附件：${escapeHTML(item.name)}">×</button></div>`;
+  }).join("");
+}
+
+function addPendingUploads(fileList) {
+  const files = [...fileList];
+  const remaining = 8 - state.pendingUploads.length;
+  let totalSize = state.pendingUploads.reduce((sum, item) => sum + item.file.size, 0);
+  if (files.length > remaining) showChatStatus("一条消息最多添加 8 个附件。", true);
+  for (const file of files.slice(0, Math.max(remaining, 0))) {
+    if (file.size > 20 * 1024 * 1024) {
+      showChatStatus(`${file.name} 超过 20 MB，未添加。`, true);
+      continue;
+    }
+    if (totalSize + file.size > 40 * 1024 * 1024) {
+      showChatStatus("一条消息的附件总大小不能超过 40 MB。", true);
+      continue;
+    }
+    state.pendingUploads.push({
+      file,
+      name: file.name || "附件",
+      kind: chatAttachmentKind(file),
+      previewUrl: URL.createObjectURL(file),
+    });
+    totalSize += file.size;
+  }
+  renderPendingAttachments();
+}
+
 function renderProjects() {
-  projectList.innerHTML = state.projects.length
-    ? state.projects.map((project) => `
-      <button class="project-link ${state.project?.id === project.id ? "is-active" : ""}"
-        type="button" data-project-id="${escapeHTML(project.id)}">
-        <span class="project-symbol" aria-hidden="true">${project.mode === "chat" ? "◌" : "▰"}</span>
-        <span class="project-link-copy"><strong>${escapeHTML(project.title)}</strong><small>${project.mode === "chat" ? "普通对话" : escapeHTML(stageLabel(project.active_stage))}</small></span>
-      </button>`).join("")
+  const recentProjects = state.projects.filter((project) => !project.archived);
+  projectList.innerHTML = recentProjects.length
+    ? recentProjects.map((project) => `
+      <div class="project-entry">
+        <button class="project-link ${state.project?.id === project.id ? "is-active" : ""}"
+          type="button" data-project-id="${escapeHTML(project.id)}" ${state.project?.id === project.id ? 'aria-current="page"' : ""}>
+          <span class="project-symbol" aria-hidden="true">${project.mode === "chat" ? "◌" : "▰"}</span>
+          <span class="project-link-copy"><strong>${escapeHTML(project.title)}</strong><small>${project.mode === "chat" ? "普通对话" : escapeHTML(stageLabel(project.active_stage))}</small></span>
+        </button>
+        <span class="project-management">
+          <button type="button" data-rename-project="${escapeHTML(project.id)}" aria-label="重命名：${escapeHTML(project.title)}" title="重命名">✎</button>
+          <button type="button" data-archive-project="${escapeHTML(project.id)}" aria-label="从最近对话移除：${escapeHTML(project.title)}" title="从最近对话移除">×</button>
+        </span>
+      </div>`).join("")
     : '<p class="empty-projects">你的对话和创作流程会出现在这里。</p>';
   projectList.querySelectorAll("[data-project-id]").forEach((button) => {
     button.addEventListener("click", () => openProject(button.dataset.projectId));
+  });
+  projectList.querySelectorAll("[data-rename-project]").forEach((button) => {
+    button.addEventListener("click", () => openRenameProject(button.dataset.renameProject));
+  });
+  projectList.querySelectorAll("[data-archive-project]").forEach((button) => {
+    button.addEventListener("click", () => archiveProject(button.dataset.archiveProject));
   });
 }
 
@@ -964,6 +1045,7 @@ async function openProductionRecord(projectId) {
 }
 
 async function showProductionRecords() {
+  clearPendingUploads();
   state.project = null;
   state.viewStage = null;
   state.chatMessages = [];
@@ -980,8 +1062,69 @@ async function refreshProjects() {
   renderProjects();
 }
 
+function openRenameProject(projectId) {
+  const project = state.projects.find((item) => item.id === projectId);
+  if (!project || renameDialog.open) return;
+  state.renameProjectId = projectId;
+  const input = document.querySelector("#rename-input");
+  input.value = project.title || "";
+  document.querySelector("#rename-error").textContent = "";
+  renameDialog.showModal();
+  input.focus();
+  input.select();
+}
+
+async function saveProjectTitle(event) {
+  event.preventDefault();
+  if (!state.renameProjectId) return;
+  const input = document.querySelector("#rename-input");
+  const title = input.value.trim();
+  if (!title) {
+    document.querySelector("#rename-error").textContent = "名称不能为空。";
+    input.focus();
+    return;
+  }
+  try {
+    const project = await api(`/api/projects/${encodeURIComponent(state.renameProjectId)}/title`, {
+      method: "PUT", body: JSON.stringify({ title }),
+    });
+    state.projects = state.projects.map((item) => item.id === project.id ? project : item);
+    if (state.project?.id === project.id) {
+      state.project = project;
+      document.querySelector("#top-title").textContent = project.title;
+      if (state.viewMode === "records") renderProductionRecords();
+      if (state.viewMode === "record-detail") renderProductionRecordDetail(project);
+    }
+    renameDialog.close();
+    renderProjects();
+  } catch (error) {
+    document.querySelector("#rename-error").textContent = error.message;
+  }
+}
+
+async function archiveProject(projectId) {
+  const project = state.projects.find((item) => item.id === projectId);
+  if (!project) return;
+  const confirmed = await confirmInApp({
+    title: "从最近对话移除？",
+    message: `“${project.title}”只会从最近对话列表隐藏。聊天内容、制作记录、任务和本地媒体都会保留。之后可从制作记录继续打开创作流程。`,
+    confirmLabel: "从列表移除",
+  });
+  if (!confirmed) return;
+  try {
+    const updated = await api(`/api/projects/${encodeURIComponent(projectId)}/archive`, { method: "POST" });
+    state.projects = state.projects.map((item) => item.id === projectId ? updated : item);
+    if (state.project?.id === projectId) state.project = updated;
+    renderProjects();
+    showNotice("已从最近对话移除；项目和制作记录仍保留。", false);
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
 async function openProject(projectId) {
   try {
+    if (state.project?.id !== projectId) clearPendingUploads();
     state.project = await api(`/api/projects/${encodeURIComponent(projectId)}`);
     state.viewStage = state.project.active_stage;
     showNotice("");
@@ -994,6 +1137,7 @@ async function openProject(projectId) {
 
 async function createProject(event) {
   event.preventDefault();
+  clearPendingUploads();
   const formData = new FormData(event.currentTarget);
   const payload = Object.fromEntries(formData.entries());
   payload.duration_seconds = Number(payload.duration_seconds);
@@ -1163,15 +1307,18 @@ async function updateModel() {
 function renderChatMessage(item) {
   const isUser = item.role === "user";
   const attachments = (item.attachments || []).map((asset) => {
-    const url = safeMediaUrl(asset.url);
+    const url = asset.preview_url?.startsWith("blob:")
+      ? escapeHTML(asset.preview_url)
+      : safeMediaUrl(asset.url);
     if (!url) return "";
-    if (asset.type === "image") return `<a class="chat-image-link" href="${url}" target="_blank" rel="noreferrer"><img src="${url}" alt="AI 生成的图片" loading="lazy" /></a>`;
-    if (asset.type === "video") return `<video class="chat-video" controls preload="metadata" src="${url}" aria-label="AI 生成的视频"></video>`;
+    if (asset.type === "image") return `<a class="chat-image-link" href="${url}" target="_blank" rel="noreferrer"><img src="${url}" alt="${escapeHTML(asset.filename || "对话图片")}" loading="lazy" /></a>`;
+    if (asset.type === "video") return `<video class="chat-video" controls preload="metadata" src="${url}" aria-label="${escapeHTML(asset.filename || "对话视频")}"></video>`;
     if (asset.type === "audio") return `<audio class="chat-audio" controls preload="metadata" src="${url}" aria-label="AI 生成的语音"></audio>`;
+    if (asset.type === "file") return `<a class="chat-file-link" href="${url}" download="${escapeHTML(asset.filename || "附件")}"><span aria-hidden="true">▤</span><span><strong>${escapeHTML(asset.filename || "附件")}</strong><small>${formatFileSize(Number(asset.size || 0))}</small></span></a>`;
     return "";
   }).join("");
   const content = isUser
-    ? `<p>${escapeHTML(item.content)}</p>`
+    ? `<p>${escapeHTML(item.content || (item.attachments?.length ? "请查看附件" : ""))}</p>`
     : item.pending && !String(item.content ?? "").trim()
       ? '<div class="chat-thinking" role="status" aria-label="助手正在思考"><i></i><i></i><i></i><span>思考中…</span></div>'
       : `<div class="chat-markdown">${renderMarkdown(item.content)}${item.pending ? '<span class="stream-cursor" aria-hidden="true"></span>' : ""}</div>`;
@@ -1293,10 +1440,15 @@ function renderChatScreen({ preserveDraft = false } = {}) {
       <div class="chat-composer-area">
         <p id="chat-status" class="chat-status" role="status" aria-live="polite"></p>
         <form id="chat-form" class="chat-form">
+          <div id="chat-pending-attachments" class="chat-pending-attachments" hidden></div>
           <label class="sr-only" for="chat-input">发送给创作助手</label>
-          <textarea id="chat-input" rows="2" maxlength="10000" required placeholder="说说你想聊什么，或描述想创作的内容……"></textarea>
+          <textarea id="chat-input" rows="2" maxlength="10000" placeholder="说说你想聊什么，或描述想创作的内容……"></textarea>
           <div class="chat-form-footer">
-            <span>明确要求生成图片、视频或语音时，才会调用对应模型。</span>
+            <div class="chat-composer-tools">
+              <label class="chat-attach-button" for="chat-file-input" aria-label="添加图片、视频或文件">＋ 添加附件</label>
+              <input id="chat-file-input" type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime,video/webm,.m4v,.txt,.md,.csv,.json,.yaml,.yml,.xml,.html,.log,.pdf,.docx" hidden />
+              <span>每个附件≤20 MB、单条合计≤40 MB，最多 8 个。视频最多分析 6 帧、不含声音；媒体生成前先确认。</span>
+            </div>
             <button class="button button-primary" id="send-chat" type="submit" aria-label="发送消息">发送 <span aria-hidden="true">↗</span></button>
           </div>
         </form>
@@ -1304,11 +1456,32 @@ function renderChatScreen({ preserveDraft = false } = {}) {
       </div>
     </section>`;
   renderChat();
+  renderPendingAttachments();
   document.querySelector("#chat-messages").addEventListener("click", (event) => {
     if (event.target.closest("#load-older-chat")) loadOlderChatMessages();
   });
+  document.querySelector("#chat-pending-attachments").addEventListener("click", (event) => {
+    const remove = event.target.closest("[data-remove-pending]");
+    if (!remove) return;
+    const [item] = state.pendingUploads.splice(Number(remove.dataset.removePending), 1);
+    if (item?.previewUrl) URL.revokeObjectURL(item.previewUrl);
+    renderPendingAttachments();
+  });
+  document.querySelector("#chat-file-input").addEventListener("change", (event) => {
+    addPendingUploads(event.target.files);
+    event.target.value = "";
+  });
+  const chatForm = document.querySelector("#chat-form");
+  chatForm.addEventListener("submit", sendChat);
+  chatForm.addEventListener("dragover", (event) => {
+    if (event.dataTransfer?.types.includes("Files")) event.preventDefault();
+  });
+  chatForm.addEventListener("drop", (event) => {
+    if (!event.dataTransfer?.files.length) return;
+    event.preventDefault();
+    if (!state.chatSending) addPendingUploads(event.dataTransfer.files);
+  });
   if (draft) document.querySelector("#chat-input").value = draft;
-  document.querySelector("#chat-form").addEventListener("submit", sendChat);
   document.querySelector("#chat-input").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -1373,29 +1546,62 @@ async function readChatStream(response, onEvent) {
   if (!receivedDone) throw new Error("连接已中断，模型回复尚未完成。");
 }
 
+async function uploadChatAttachments(projectId, pendingFiles) {
+  const newFiles = pendingFiles.filter((item) => !item.storedAttachment);
+  if (newFiles.length) {
+    const formData = new FormData();
+    for (const item of newFiles) formData.append("files", item.file, item.file.name);
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/chat/attachments`, {
+      method: "POST", body: formData,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `附件上传失败（${response.status}）`);
+    newFiles.forEach((item, index) => { item.storedAttachment = payload[index]; });
+  }
+  return pendingFiles.map((item) => item.storedAttachment);
+}
+
+function releaseUploadPreviews(uploads) {
+  for (const item of uploads) {
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+  }
+}
+
 async function sendChat(event) {
   event.preventDefault();
   if (state.chatSending) return;
   const input = document.querySelector("#chat-input");
   const sendButton = document.querySelector("#send-chat");
-  const status = document.querySelector("#chat-status");
   const message = input.value.trim();
-  if (!message) return;
+  const pendingFiles = [...state.pendingUploads];
+  if (!message && !pendingFiles.length) return;
 
   const sendStartedAt = Date.now();
   const localId = `local-${crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
-  const userMessage = { id: localId, role: "user", content: message };
+  const userMessage = {
+    id: localId,
+    role: "user",
+    content: message || "请查看附件",
+    attachments: pendingFiles.map((item) => ({
+      type: item.kind, filename: item.name, size: item.file.size, preview_url: item.previewUrl,
+    })),
+  };
   const assistantMessage = { id: `${localId}-reply`, role: "assistant", content: "", pending: true };
   state.chatMessages.push(userMessage, assistantMessage);
+  state.pendingUploads = [];
   input.value = "";
+  renderPendingAttachments();
   renderChat();
 
   state.chatSending = true;
   sendButton.disabled = true;
+  document.querySelector("#chat-file-input").disabled = true;
+  input.disabled = true;
   modelSelect.disabled = true;
-  status.textContent = "正在连接模型…";
+  showChatStatus("正在准备对话…");
   const model = modelSelect.value || state.selectedModel || state.config.default_model;
   let completed = false;
+  let uploadedAttachments = [];
   try {
     if (!state.project) {
       state.project = await api("/api/chat/sessions", {
@@ -1403,10 +1609,16 @@ async function sendChat(event) {
       });
       await refreshProjects();
     }
+    if (pendingFiles.length) {
+      showChatStatus("正在上传附件…");
+      uploadedAttachments = await uploadChatAttachments(state.project.id, pendingFiles);
+      userMessage.attachments = uploadedAttachments;
+      renderChat();
+    }
     const response = await fetch(`/api/projects/${encodeURIComponent(state.project.id)}/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({ message, model }),
+      body: JSON.stringify({ message, model, attachment_ids: uploadedAttachments.map((item) => item.id) }),
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
@@ -1414,7 +1626,7 @@ async function sendChat(event) {
     }
     await readChatStream(response, (streamEvent) => {
       if (streamEvent.type === "status") {
-        status.textContent = streamEvent.message || "正在处理…";
+        showChatStatus(streamEvent.message || "正在处理…");
       } else if (streamEvent.type === "delta") {
         assistantMessage.content += streamEvent.text || "";
         updateStreamingMessage(assistantMessage);
@@ -1426,10 +1638,11 @@ async function sendChat(event) {
         document.querySelector("#top-title").textContent = state.project.title;
       }
     });
+    releaseUploadPreviews(pendingFiles);
     await refreshProjects();
-    status.textContent = "";
+    showChatStatus("");
   } catch (error) {
-    status.textContent = error.message;
+    showChatStatus(error.message, true);
     try {
       if (state.project) {
         const projectId = state.project.id;
@@ -1438,15 +1651,25 @@ async function sendChat(event) {
         state.project = await api(`/api/projects/${encodeURIComponent(projectId)}`);
         await refreshProjects();
         const userWasSaved = history.some((item) =>
-          item.role === "user" && item.content === message && Date.parse(item.created_at || "") >= sendStartedAt - 5000,
+          item.role === "user"
+          && Date.parse(item.created_at || "") >= sendStartedAt - 5000
+          && (uploadedAttachments.length
+            ? uploadedAttachments.every((attachment) => item.attachments?.some((saved) => saved.id === attachment.id))
+            : item.content === (message || "请结合附件和之前的对话理解我的需求；如果目标不明确，先向我确认需要做什么。")),
         );
         state.chatMessages = mergeChatMessages(state.chatMessages, history);
         if (userWasSaved) {
-          state.chatMessages.push({
-            id: `${localId}-error`, role: "assistant", content: `请求未完成：${error.message}`, failed: true,
-          });
-        } else if (!input.value.trim()) {
-          input.value = message;
+          releaseUploadPreviews(pendingFiles);
+          if (!completed) {
+            state.chatMessages.push({
+              id: `${localId}-error`, role: "assistant", content: `请求未完成：${error.message}`, failed: true,
+            });
+          }
+        } else {
+          state.chatMessages = state.chatMessages.filter((item) => item.id !== localId && item.id !== assistantMessage.id);
+          state.pendingUploads = pendingFiles;
+          renderPendingAttachments();
+          if (!input.value.trim()) input.value = message;
         }
         if (!state.chatHasMore) {
           state.chatHasMore = Boolean(page.has_more);
@@ -1455,12 +1678,16 @@ async function sendChat(event) {
         renderChat();
       } else {
         state.chatMessages = state.chatMessages.filter((item) => item.id !== localId && item.id !== assistantMessage.id);
+        state.pendingUploads = pendingFiles;
+        renderPendingAttachments();
         if (!input.value.trim()) input.value = message;
         renderChat();
       }
     } catch {
       if (!completed) {
         state.chatMessages = state.chatMessages.filter((item) => item.id !== localId && item.id !== assistantMessage.id);
+        state.pendingUploads = pendingFiles;
+        renderPendingAttachments();
         if (!input.value.trim()) input.value = message;
         renderChat();
       }
@@ -1468,6 +1695,8 @@ async function sendChat(event) {
   } finally {
     state.chatSending = false;
     sendButton.disabled = false;
+    document.querySelector("#chat-file-input").disabled = false;
+    input.disabled = false;
     syncModelControl();
     input.focus();
   }
@@ -1744,8 +1973,11 @@ async function initialize() {
       }
     });
     document.querySelector("#close-models").addEventListener("click", () => modelsDialog.close());
+    document.querySelector("#rename-form").addEventListener("submit", saveProjectTitle);
+    document.querySelector("#rename-cancel").addEventListener("click", () => renameDialog.close());
     document.querySelector("#open-records")?.addEventListener("click", showProductionRecords);
     document.querySelector("#new-project").addEventListener("click", () => {
+      clearPendingUploads();
       state.project = null;
       state.viewStage = null;
       state.chatMessages = [];
@@ -1758,11 +1990,13 @@ async function initialize() {
       document.querySelector("#chat-input")?.focus();
     });
     document.querySelector("#new-workflow").addEventListener("click", () => {
+      clearPendingUploads();
       showNotice("");
       renderWorkflowSetup();
       renderProjects();
     });
-    if (state.projects.length) await openProject(state.projects[0].id);
+    const mostRecent = state.projects.find((project) => !project.archived);
+    if (mostRecent) await openProject(mostRecent.id);
     else renderChatScreen();
   } catch (error) {
     showNotice(error.message, true);
