@@ -2,6 +2,7 @@
 name: model-first-video
 description: 以逐镜模型生成和人工审核为中心组织视频创作，不依赖本地传统剪辑工具。
 stages: prompt,storyboard,scenes
+tracks: marketing
 ---
 
 # 模型优先的视频制作

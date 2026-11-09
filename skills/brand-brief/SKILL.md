@@ -2,6 +2,7 @@
 name: brand-brief
 description: 将品牌、产品、受众和目标转成一致的创作约束。
 stages: script, prompt, storyboard, scenes
+tracks: marketing
 ---
 
 # 品牌与 brief 约束

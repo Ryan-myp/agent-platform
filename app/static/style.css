@@ -74,7 +74,8 @@ h1, h2, p { margin-top: 0; }
 .welcome-copy > p { max-width: 590px; margin-bottom: 0; color: #64716a; line-height: 1.75; }
 .brief-form { display: grid; gap: 17px; margin-top: 31px; border-top: 1px solid #e7e8e1; padding-top: 24px; }
 .brief-form label { display: grid; gap: 7px; color: #38443d; font-size: 12px; font-weight: 600; }
-.brief-form input, .brief-form textarea { width: 100%; min-width: 0; border: 1px solid #d6dcd3; border-radius: 4px; background: #fff; color: var(--ink); padding: 11px 12px; font-size: 13px; font-weight: 400; line-height: 1.5; }
+.brief-form input, .brief-form textarea, .brief-form select { width: 100%; min-width: 0; border: 1px solid #d6dcd3; border-radius: 4px; background: #fff; color: var(--ink); padding: 11px 12px; font-size: 13px; font-weight: 400; line-height: 1.5; }
+.brief-form select { min-height: 43px; cursor: pointer; }
 .brief-form input::placeholder, .brief-form textarea::placeholder { color: #9ba49c; }
 .brief-form textarea { resize: vertical; }
 .form-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
@@ -458,6 +459,7 @@ h1, h2, p { margin-top: 0; }
   .record-output-card { padding: 14px; }
   .record-output-card > header { flex-wrap: wrap; }
   .form-row, .form-row-three { grid-template-columns: 1fr; }
+  .brief-form input, .brief-form textarea, .brief-form select { font-size: 16px; }
   .form-footer { align-items: flex-start; flex-direction: column; }
   .workflow-preview { flex-wrap: wrap; row-gap: 12px; }
   .workflow-preview .step-connector { display: none; }

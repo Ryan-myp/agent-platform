@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProjectCreate(BaseModel):
+    track: Literal["marketing", "drama"] = "marketing"
     business: str = Field(min_length=1, max_length=300)
     product: str = Field(min_length=1, max_length=300)
     audience: str = Field(min_length=1, max_length=500)

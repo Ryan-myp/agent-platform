@@ -2,6 +2,7 @@
 name: scene-image-prompts
 description: 为分镜中的每个镜头编写图像任务提示词并保持视觉连续性。
 stages: scenes
+tracks: marketing
 ---
 
 # 场景图片与视频任务

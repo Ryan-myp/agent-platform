@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
+import re
 import threading
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -17,7 +18,7 @@ from app.providers.media import (
     create_image_provider,
 )
 from app.providers.text import create_text_provider
-from app.stages import INSTRUCTIONS, STAGE_IDS, STAGES
+from app.stages import STAGE_IDS, STAGES, TRACK_INSTRUCTIONS, TRACK_LABELS, TRACK_STAGE_INSTRUCTIONS
 from app.store import ProjectStore
 from app.skills.loader import SkillLoader
 from app.services.production import (
@@ -32,6 +33,18 @@ class WorkflowError(Exception):
     def __init__(self, message: str, status_code: int = 400):
         super().__init__(message)
         self.status_code = status_code
+
+
+_BLOCKING_CONTENT_PATTERNS = (
+    re.compile(r"(?:暂)?无法(?:直接|继续)?(?:撰写|生成)"),
+    re.compile(r"(?:核心字段|关键信息).{0,30}(?:缺失|不足|模糊)"),
+    re.compile(r"(?:缺失|不足|模糊).{0,40}无法"),
+    re.compile(r"必须补充.{0,30}才能(?:继续|生成)"),
+)
+
+
+def _has_blocking_content(content: str) -> bool:
+    return any(pattern.search(content) for pattern in _BLOCKING_CONTENT_PATTERNS)
 
 
 def now_iso() -> str:
@@ -60,6 +73,9 @@ class WorkflowService:
     def create_project(self, data: dict) -> dict:
         mode = data.pop("mode", "workflow")
         title = data.pop("title", None)
+        track = data.pop("track", "marketing")
+        if track not in TRACK_LABELS:
+            raise WorkflowError("未知的创作类型。", 422)
         model = data.pop("model", None) or self.settings.model_catalog.defaults["text"]
         self._validate_model(model)
         if mode not in {"chat", "workflow"}:
@@ -68,8 +84,9 @@ class WorkflowService:
         created = now_iso()
         project = {
             "id": str(uuid4()),
-            "title": ((title or "").strip() or "新对话") if mode == "chat" else data["product"].strip() or "营销视频创作",
+            "title": ((title or "").strip() or "新对话") if mode == "chat" else data["product"].strip() or ("短剧 / 漫剧创作" if track == "drama" else "营销视频创作"),
             "mode": mode,
+            "track": track,
             "brief": brief,
             "model": model,
             "active_stage": STAGE_IDS[0],
@@ -237,12 +254,32 @@ class WorkflowService:
             else:
                 video["status"] = "pending"
 
+    def _blocking_upstream_stages(self, project: dict, stage: str) -> list[str]:
+        target_index = STAGE_IDS.index(stage)
+        return [
+            stage_id
+            for stage_id in STAGE_IDS[:target_index]
+            if _has_blocking_content(project.get("workflow", {}).get(stage_id, {}).get("content") or "")
+        ]
+
     def generate(self, project_id: str, stage: str, model: str | None = None) -> dict:
         if stage not in STAGE_IDS:
             raise WorkflowError("未知的创作步骤。", 404)
         project = self.get_project(project_id)
         if project["active_stage"] != stage:
             raise WorkflowError("请先完成并确认前一个步骤，再继续生成。", 409)
+        blocked_stages = self._blocking_upstream_stages(project, stage)
+        if blocked_stages:
+            labels = {
+                item["id"]: item["label"]
+                for item in STAGES
+            }
+            blocked_labels = "、".join(labels.get(stage_id, stage_id) for stage_id in blocked_stages)
+            raise WorkflowError(
+                f"无法生成“{labels.get(stage, stage)}”：已确认的{blocked_labels}仍包含信息不足或无法继续等阻塞说明。"
+                "请回退到最早的阻塞步骤，补充真实项目 brief 或编辑草稿后重新确认；本次未调用模型。",
+                409,
+            )
         if stage == "video":
             video_workflow = project.get("workflow", {}).get("video", {})
             if video_workflow.get("shots"):
@@ -283,16 +320,34 @@ class WorkflowService:
             if STAGE_IDS.index(stage_id) < STAGE_IDS.index(stage)
             and project["workflow"][stage_id]["content"]
         }
-        skill_context = self.skills.for_stage(stage)
+        track = project.get("track", "marketing")
+        skill_context = self.skills.for_stage(stage, track)
+        track_instruction = TRACK_INSTRUCTIONS.get(track, TRACK_INSTRUCTIONS["marketing"])
+        stage_instruction = TRACK_STAGE_INSTRUCTIONS.get(track, TRACK_STAGE_INSTRUCTIONS["marketing"])[stage]
         system = (
-            "你是营销视频创作工作台中的专业内容策划。遵守用户提供的事实和品牌要求；"
-            "不捏造数据、效果、证言或产品属性。输出可直接审阅的中文内容。\n\n"
-            f"当前步骤：{stage}\n要求：{INSTRUCTIONS[stage]}\n\n"
+            f"你是{TRACK_LABELS.get(track, TRACK_LABELS['marketing'])}创作工作台中的专业内容策划。"
+            "遵守用户提供的事实，不捏造数据、效果、证言或产品属性；输出可直接审阅的中文内容。\n\n"
+            f"当前创作类型：{TRACK_LABELS.get(track, TRACK_LABELS['marketing'])}\n"
+            f"类型要求：{track_instruction}\n当前步骤：{stage}\n要求：{stage_instruction}\n\n"
             f"适用的本地创作技能：\n{skill_context or '无'}"
         )
+        brief = project["brief"]
+        if track == "drama":
+            brief_context = {
+                "故事背景 / 核心设定": brief.get("business", ""),
+                "作品 / 项目名": brief.get("product", ""),
+                "目标观众 / 题材偏好": brief.get("audience", ""),
+                "发布平台 / 画幅方向": brief.get("platform", ""),
+                "单集目标时长（秒）": brief.get("duration_seconds"),
+                "视觉风格 / 媒介": brief.get("style", ""),
+            }
+            brief_label = "短剧 / 漫剧创作 brief"
+        else:
+            brief_context = brief
+            brief_label = "品牌营销 brief"
         user = (
             f"stage={stage}\n"
-            f"项目 brief：{project['brief']}\n"
+            f"{brief_label}：{brief_context}\n"
             f"已确认的前序内容：{previous or '无'}\n"
             "请根据这些信息完成当前步骤。若 brief 缺少必要信息，请在结果中标出待确认项，不要自行杜撰。"
         )
@@ -513,6 +568,11 @@ class WorkflowService:
         item = project["workflow"][stage]
         if item["status"] != "ready" or not item["content"]:
             raise WorkflowError("请先生成或填写本步骤内容，再确认。", 409)
+        if stage != "scenes" and _has_blocking_content(item["content"]):
+            raise WorkflowError(
+                "这份草稿明确包含信息不足或无法继续等阻塞说明，不能确认。请补充事实或编辑草稿后再继续。",
+                409,
+            )
         if stage == "scenes":
             try:
                 scene_plan = normalize_scene_plan(item["content"])

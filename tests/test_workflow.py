@@ -14,6 +14,7 @@ from app.main import create_app
 from app.providers.catalog import ModelCatalog, ModelProfile
 from app.providers.media import AgnesVideoProvider, AssetStore, OpenAICompatibleImageProvider
 from app.providers.text import ChatResult, OpenAICompatibleTextProvider
+from app.services.chat import ChatService
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG_PATH = ROOT / "config" / "models.json"
@@ -86,6 +87,7 @@ def new_project(client, model=None):
     return client.post(
         "/api/projects",
         json={
+            "track": "marketing",
             "business": "帮助小型咖啡馆经营会员",
             "product": "咖啡馆会员工具",
             "audience": "希望提高复购的小型咖啡馆经营者",
@@ -104,8 +106,8 @@ def test_home_page_avoids_stale_markup_and_loads_versioned_assets(tmp_path):
     assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate"
     assert 'id="open-records"' in response.text
     assert 'id="confirm-dialog"' in response.text
-    assert "/static/app.js?v=7" in response.text
-    assert "/static/style.css?v=7" in response.text
+    assert "/static/app.js?v=10" in response.text
+    assert "/static/style.css?v=10" in response.text
 
 
 def test_create_generate_edit_and_approve_advances_one_stage(tmp_path):
@@ -135,6 +137,88 @@ def test_create_generate_edit_and_approve_advances_one_stage(tmp_path):
     assert approved.status_code == 200
     assert approved.json()["workflow"]["script"]["status"] == "approved"
     assert approved.json()["active_stage"] == "prompt"
+
+
+def test_project_track_persists_and_invalid_tracks_are_rejected(tmp_path):
+    client = make_client(tmp_path)
+    payload = {
+        "track": "drama",
+        "business": "被忽视的长女回乡争取旧宅产权",
+        "product": "旧宅回声 EP001",
+        "audience": "都市家庭悬疑观众",
+        "platform": "竖屏短剧",
+        "style": "真人短剧，克制写实",
+        "duration_seconds": 60,
+        "model": "agnes-text",
+    }
+
+    created = client.post("/api/projects", json=payload)
+
+    assert created.status_code == 201
+    assert created.json()["track"] == "drama"
+    assert created.json()["brief"]["product"] == "旧宅回声 EP001"
+    payload["track"] = "unknown"
+    assert client.post("/api/projects", json=payload).status_code == 422
+
+
+def test_drama_track_uses_only_drama_stage_guidance(tmp_path, monkeypatch):
+    received = {}
+
+    class CaptureProvider:
+        def generate(self, *, system, user):
+            received["system"] = system
+            received["user"] = user
+            return "测试短剧脚本草稿"
+
+    monkeypatch.setattr(
+        "app.services.workflow.create_text_provider",
+        lambda profile, api_key: CaptureProvider(),
+    )
+    client = make_client(tmp_path)
+    project = client.post("/api/projects", json={
+        "track": "drama",
+        "business": "长女回乡争取旧宅",
+        "product": "旧宅回声",
+        "audience": "都市家庭悬疑观众",
+        "platform": "竖屏短剧",
+        "style": "真人短剧，克制写实",
+        "duration_seconds": 60,
+        "model": "agnes-text",
+    }).json()
+
+    generated = client.post(f"/api/projects/{project['id']}/generate/script", json={})
+
+    assert generated.status_code == 200
+    assert generated.json()["workflow"]["script"]["content"] == "测试短剧脚本草稿"
+    assert "短剧 / 漫剧" in received["system"]
+    assert "短剧 / 漫剧脚本" in received["system"]
+    assert "竖屏短视频脚本" not in received["system"]
+    assert "核心卖点" not in received["system"]
+    assert "明确 CTA" not in received["system"]
+    assert "故事背景 / 核心设定" in received["user"]
+    assert "短剧 / 漫剧创作 brief" in received["user"]
+
+
+def test_drama_chat_context_uses_story_labels_and_no_marketing_assumptions():
+    context = ChatService._context({
+        "mode": "workflow",
+        "track": "drama",
+        "brief": {
+            "business": "长女回乡争取旧宅",
+            "product": "旧宅回声",
+            "audience": "都市悬疑观众",
+            "platform": "竖屏短剧",
+            "duration_seconds": 60,
+            "style": "真人写实",
+        },
+        "workflow": {},
+    })
+
+    assert "这是短剧 / 漫剧创作项目" in context
+    assert "故事背景 / 核心设定" in context
+    assert "长女回乡争取旧宅" in context
+    assert "品牌营销视频项目" not in context
+    assert "不强加品牌卖点" in context
 
 
 def test_cannot_skip_unconfirmed_stage_or_approve_empty_stage(tmp_path):
@@ -180,6 +264,51 @@ def test_scene_tasks_are_validated_before_save_and_approval(tmp_path):
     shots = approved.json()["workflow"]["video"]["shots"]
     assert len(shots) == 3
     assert all(shot["image"]["status"] == "pending" and shot["video"]["status"] == "pending" for shot in shots)
+
+
+def test_approval_rejects_stage_content_with_explicit_blockers(tmp_path):
+    client = make_client(tmp_path)
+    project_id = new_project(client).json()["id"]
+    assert client.post(f"/api/projects/{project_id}/generate/script", json={}).status_code == 200
+
+    blocked_content = "根据 brief，关键信息缺失或模糊，无法直接撰写有效脚本。请补充产品与受众信息后再继续。"
+    edited = client.put(
+        f"/api/projects/{project_id}/content/script",
+        json={"content": blocked_content},
+    )
+    assert edited.status_code == 200
+
+    response = client.post(f"/api/projects/{project_id}/approve/script")
+
+    assert response.status_code == 409
+    assert "不能确认" in response.json()["detail"]
+    project = client.get(f"/api/projects/{project_id}").json()
+    assert project["active_stage"] == "script"
+    assert project["workflow"]["script"]["status"] == "ready"
+
+
+def test_generation_stops_before_model_call_for_blocked_upstream_content(tmp_path, monkeypatch):
+    client = make_client(tmp_path)
+    project = new_project(client).json()
+    workflow = client.app.state.workflow
+    stored = workflow.get_project(project["id"])
+    blocked_content = "当前关键信息缺失或模糊，必须补充后才能生成有效内容。"
+    for stage in ("script", "prompt", "storyboard"):
+        stored["workflow"][stage].update({"status": "approved", "content": blocked_content})
+    stored["active_stage"] = "scenes"
+    workflow.store.save(stored)
+
+    provider_created = []
+    monkeypatch.setattr(
+        "app.services.workflow.create_text_provider",
+        lambda profile, api_key: provider_created.append(profile.id),
+    )
+    response = client.post(f"/api/projects/{project['id']}/generate/scenes", json={})
+
+    assert response.status_code == 409
+    assert "脚本、视觉设定、分镜" in response.json()["detail"]
+    assert "本次未调用模型" in response.json()["detail"]
+    assert provider_created == []
 
 
 def test_empty_scene_plan_error_suggests_reviewing_blocked_upstream_content(tmp_path, monkeypatch):
@@ -430,7 +559,11 @@ def test_models_skills_and_chat_are_discoverable(tmp_path):
 
     skills = client.get("/api/skills").json()
     names = {skill["name"] for skill in skills}
-    assert {"brand-brief", "short-form-video", "storyboard", "scene-image-prompts", "model-first-video"} <= names
+    assert {
+        "brand-brief", "short-form-video", "storyboard", "scene-image-prompts",
+        "model-first-video", "video", "drama-script", "drama-visual",
+        "drama-storyboard", "drama-scene-prompts",
+    } <= names
 
     project = new_project(client).json()
     history = client.get(f"/api/projects/{project['id']}/chat")

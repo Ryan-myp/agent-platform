@@ -2,6 +2,7 @@
 name: short-form-video
 description: 编写适配竖屏短视频的脚本，关注开场、节奏、静音观看和承诺兑现。
 stages: script
+tracks: marketing
 ---
 
 # 竖屏短视频脚本

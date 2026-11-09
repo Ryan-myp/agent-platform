@@ -2,6 +2,7 @@
 name: storyboard
 description: 将已确认的脚本拆成拍摄或生成工具可执行的镜头计划。
 stages: storyboard
+tracks: marketing
 ---
 
 # 分镜规划

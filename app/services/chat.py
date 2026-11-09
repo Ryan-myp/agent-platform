@@ -285,10 +285,26 @@ class ChatService:
                 instructions
                 + "这是普通对话，没有预设的项目 brief。只依据用户在对话中提供的信息回答；缺少关键信息时再提问，不要假设产品事实。"
             )
+        track = project.get("track", "marketing")
+        track_context = (
+            "这是短剧 / 漫剧创作项目。围绕人物、冲突、选择和可见后果讨论，不强加品牌卖点或 CTA。"
+            if track == "drama"
+            else "这是品牌营销视频项目。遵守用户 brief，不要捏造产品事实、效果数据或证言。"
+        )
+        brief = project.get("brief", {})
+        if track == "drama":
+            brief = {
+                "故事背景 / 核心设定": brief.get("business", ""),
+                "作品 / 项目名": brief.get("product", ""),
+                "目标观众 / 题材偏好": brief.get("audience", ""),
+                "发布平台 / 画幅方向": brief.get("platform", ""),
+                "单集目标时长（秒）": brief.get("duration_seconds"),
+                "视觉风格 / 媒介": brief.get("style", ""),
+            }
         return (
             instructions
-            + "遵守用户 brief，不要捏造产品事实、效果数据或证言。\n"
-            + f"项目 brief：{json.dumps(project.get('brief', {}), ensure_ascii=False)}\n"
+            + track_context + "\n"
+            + f"项目 brief：{json.dumps(brief, ensure_ascii=False)}\n"
             + f"已确认的工作流内容：{json.dumps(approved, ensure_ascii=False)}"
         )
 

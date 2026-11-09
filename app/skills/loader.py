@@ -39,13 +39,36 @@ class SkillLoader:
             )
         return skills
 
-    def for_stage(self, stage: str) -> str:
+    @staticmethod
+    def _selected_references(skill_dir: Path, metadata: dict[str, str]) -> str:
+        references: list[str] = []
+        references_dir = (skill_dir / "references").resolve()
+        for name in metadata.get("references", "").split(","):
+            name = name.strip()
+            if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+                continue
+            reference_file = references_dir / f"{name}.md"
+            try:
+                reference_file.resolve().relative_to(references_dir)
+            except ValueError:
+                continue
+            if reference_file.is_file():
+                references.append(
+                    f"### Reference: {name}\n{reference_file.read_text(encoding='utf-8')}"
+                )
+        return "\n\n".join(references)
+
+    def for_stage(self, stage: str, track: str = "marketing") -> str:
         selected: list[str] = []
         if not self.root.exists():
             return ""
         for skill_file in sorted(self.root.glob("*/SKILL.md")):
             metadata, body = self._metadata_and_body(skill_file.read_text(encoding="utf-8"))
             stages = {item.strip() for item in metadata.get("stages", "*").split(",")}
-            if "*" in stages or stage in stages:
+            tracks = {item.strip() for item in metadata.get("tracks", "marketing").split(",")}
+            if ("*" in stages or stage in stages) and ("*" in tracks or track in tracks):
+                references = self._selected_references(skill_file.parent, metadata)
+                if references:
+                    body = f"{body}\n\n## Selected reference material\n{references}"
                 selected.append(f"## Skill: {metadata.get('name', skill_file.parent.name)}\n{body}")
         return "\n\n".join(selected)

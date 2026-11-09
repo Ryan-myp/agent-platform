@@ -294,6 +294,63 @@ function syncModelControl() {
   modelSelect.value = state.project?.model || state.selectedModel || state.config?.default_model || "";
 }
 
+const TRACK_SETUP_COPY = {
+  marketing: {
+    business: "你的业务是什么？",
+    product: "这次要介绍什么？",
+    audience: "你希望触达谁？",
+    platform: "发布平台",
+    duration: "视频时长（秒）",
+    style: "整体风格",
+    note: "创建后进入品牌营销工作台；每一步可先审阅和确认，媒体生成只会在你明确触发时调用已配置的服务。",
+    defaults: { platform: "抖音 / Reels / Shorts", style: "真实、清晰、有记忆点" },
+    placeholders: {
+      business: "例如：为小型咖啡馆提供会员运营工具",
+      product: "产品、服务或活动名称",
+      audience: "描述目标用户、他们关心的问题或使用场景",
+      style: "真实、清晰、有记忆点",
+    },
+  },
+  drama: {
+    business: "故事背景 / 核心设定是什么？",
+    product: "作品 / 项目名称",
+    audience: "目标观众 / 题材偏好",
+    platform: "发布平台 / 画幅方向",
+    duration: "单集目标时长（秒）",
+    style: "视觉风格 / 媒介",
+    note: "创建后进入短剧 / 漫剧工作台；不会强加品牌卖点或 CTA，媒体生成仍须由你明确触发。",
+    defaults: { platform: "竖屏短剧 / 漫剧平台", style: "真人短剧，克制写实" },
+    placeholders: {
+      business: "例如：被家族忽视的长女回到故乡，发现旧宅产权争议",
+      product: "例如：旧宅回声 · EP001",
+      audience: "例如：都市家庭悬疑 / 面向成年观众",
+      style: "例如：真人短剧，克制写实；或二维漫剧，色彩鲜明",
+    },
+  },
+};
+
+function updateWorkflowTrackCopy(track) {
+  const copy = TRACK_SETUP_COPY[track] || TRACK_SETUP_COPY.marketing;
+  for (const field of ["business", "product", "audience", "platform", "duration", "style"]) {
+    const label = document.querySelector(`[data-track-label="${field}"]`);
+    if (label) label.textContent = copy[field];
+  }
+  for (const [field, placeholder] of Object.entries(copy.placeholders)) {
+    const input = document.querySelector(`[name="${field}"]`);
+    if (input) input.placeholder = placeholder;
+  }
+  for (const [field, value] of Object.entries(copy.defaults)) {
+    const input = document.querySelector(`[name="${field}"]`);
+    if (input && !input.dataset.userEdited) input.value = value;
+  }
+  const durationInput = document.querySelector('[name="duration_seconds"]');
+  if (durationInput && !durationInput.dataset.userEdited) {
+    durationInput.value = track === "drama" ? "60" : "30";
+  }
+  const note = document.querySelector("#track-form-note");
+  if (note) note.textContent = copy.note;
+}
+
 function renderWorkflowSetup() {
   state.project = null;
   state.viewStage = null;
@@ -310,21 +367,27 @@ function renderWorkflowSetup() {
       <div class="welcome-copy">
         <div class="overline"><span class="overline-mark" aria-hidden="true"></span>分阶段创作</div>
         <h1>先定义这次创作。</h1>
-        <p>补充业务、受众和内容方向，再逐步生成脚本、提示词、分镜与场景任务。每一步都可以先审阅、编辑，再确认。</p>
+        <p>选择创作类型，补充故事设定或业务背景、目标观众和内容方向，再逐步生成脚本、视觉设定、分镜与逐镜任务。每一步都可以先审阅、编辑，再确认。</p>
       </div>
       <form id="create-form" class="brief-form">
+        <label for="project-track"><span>创作类型</span>
+          <select name="track" id="project-track">
+            <option value="marketing">品牌营销视频</option>
+            <option value="drama">短剧 / 漫剧</option>
+          </select>
+        </label>
         <div class="form-row">
-          <label>你的业务是什么？<input name="business" required maxlength="300" placeholder="例如：为小型咖啡馆提供会员运营工具" /></label>
-          <label>这次要介绍什么？<input name="product" required maxlength="300" placeholder="产品、服务或活动名称" /></label>
+          <label><span data-track-label="business">你的业务是什么？</span><input name="business" required maxlength="300" placeholder="例如：为小型咖啡馆提供会员运营工具" /></label>
+          <label><span data-track-label="product">这次要介绍什么？</span><input name="product" required maxlength="300" placeholder="产品、服务或活动名称" /></label>
         </div>
-        <label>你希望触达谁？<textarea name="audience" required maxlength="500" rows="2" placeholder="描述目标用户、他们关心的问题或使用场景"></textarea></label>
+        <label><span data-track-label="audience">你希望触达谁？</span><textarea name="audience" required maxlength="500" rows="2" placeholder="描述目标用户、他们关心的问题或使用场景"></textarea></label>
         <div class="form-row form-row-three">
-          <label>发布平台<input name="platform" value="抖音 / Reels / Shorts" maxlength="100" /></label>
-          <label>视频时长（秒）<input name="duration_seconds" type="number" min="6" max="180" value="30" required /></label>
-          <label>整体风格<input name="style" value="真实、清晰、有记忆点" maxlength="300" /></label>
+          <label><span data-track-label="platform">发布平台</span><input name="platform" value="抖音 / Reels / Shorts" maxlength="100" /></label>
+          <label><span data-track-label="duration">视频时长（秒）</span><input name="duration_seconds" type="number" min="6" max="180" value="30" required /></label>
+          <label><span data-track-label="style">整体风格</span><input name="style" value="真实、清晰、有记忆点" maxlength="300" /></label>
         </div>
         <div class="form-footer">
-          <span class="form-note">创建后进入脚本工作台；媒体生成仍只会在你明确提出时调用已配置的服务。</span>
+          <span class="form-note" id="track-form-note" aria-live="polite">创建后进入品牌营销工作台；每一步可先审阅和确认，媒体生成只会在你明确触发时调用已配置的服务。</span>
           <button class="button button-primary" type="submit">创建创作流程 <span aria-hidden="true">↗</span></button>
         </div>
       </form>
@@ -337,7 +400,17 @@ function renderWorkflowSetup() {
       <p class="workflow-note">每一步都可以先审阅和修改，再确认进入下一步。</p>
     </section>`;
 
-  document.querySelector("#create-form").addEventListener("submit", createProject);
+  const createForm = document.querySelector("#create-form");
+  const trackSelect = document.querySelector("#project-track");
+  const durationInput = createForm.querySelector('[name="duration_seconds"]');
+  durationInput.addEventListener("input", () => { durationInput.dataset.userEdited = "true"; });
+  for (const field of ["platform", "style"]) {
+    const input = createForm.querySelector(`[name="${field}"]`);
+    input.addEventListener("input", () => { input.dataset.userEdited = "true"; });
+  }
+  trackSelect.addEventListener("change", () => updateWorkflowTrackCopy(trackSelect.value));
+  updateWorkflowTrackCopy(trackSelect.value);
+  createForm.addEventListener("submit", createProject);
 }
 
 function parseScenePlan(content) {
@@ -548,15 +621,15 @@ function renderProject() {
 
   workspace.innerHTML = `
     <div class="project-heading">
-      <div><p class="section-kicker">${escapeHTML(project.brief.platform)} · ${escapeHTML(project.brief.duration_seconds)} 秒</p>
+      <div><p class="section-kicker">${escapeHTML(project.track === "drama" ? "短剧 / 漫剧" : "品牌营销视频")} · ${escapeHTML(project.brief.platform)} · ${escapeHTML(project.brief.duration_seconds)} 秒</p>
         <h1>${escapeHTML(project.title)}</h1><p class="project-description">${escapeHTML(project.brief.business)} · 面向 ${escapeHTML(project.brief.audience)}</p></div>
       <div class="project-state"><span class="state-dot" aria-hidden="true"></span>当前步骤：${escapeHTML(stageLabel(project.active_stage))}</div>
     </div>
     <nav class="stage-rail" aria-label="创作步骤">${stepButtons}</nav>
     <section class="stage-panel" aria-labelledby="stage-title">
       <div class="stage-panel-heading"><div><p class="section-kicker">${escapeHTML(statusLabel(item, viewIndex, activeIndex))}</p>
-        <h2 id="stage-title">${escapeHTML(stage.label)}</h2><p>${escapeHTML(stage.purpose)}</p></div><span class="stage-time">${escapeHTML(project.brief.duration_seconds)} 秒目标时长</span></div>
-      ${viewStage === "script" ? `<div class="brief-strip"><strong>产品 / 服务</strong><span>${escapeHTML(project.brief.product)}</span><strong>风格</strong><span>${escapeHTML(project.brief.style)}</span></div>` : ""}
+        <h2 id="stage-title">${escapeHTML(stage.label)}</h2><p>${escapeHTML(stage.purpose)}</p></div><span class="stage-time">${escapeHTML(project.brief.duration_seconds)} 秒${project.track === "drama" ? "单集目标" : "目标"}时长</span></div>
+      ${viewStage === "script" ? `<div class="brief-strip"><strong>${project.track === "drama" ? "作品 / 项目名" : "产品 / 服务"}</strong><span>${escapeHTML(project.brief.product)}</span><strong>${project.track === "drama" ? "媒介 / 风格" : "风格"}</strong><span>${escapeHTML(project.brief.style)}</span></div>` : ""}
       <div class="stage-content">${contentArea}</div>
       <div class="stage-footer"><span class="footer-hint">${isVideo ? "媒体生成按镜头单独触发；费用以供应商实际返回为准，当前不在本地拼接视频。" : "已确认步骤可回退修改；后续内容会保留并标记为过期，重新审阅后再继续。"}</span>${action}</div>
     </section>
@@ -696,10 +769,10 @@ function renderProductionRecords() {
     const completedStages = Object.values(project.workflow || {}).filter((item) => item.status === "approved").length
       + (videoShotStats(project).complete ? 1 : 0);
     const brief = project.brief || {};
-    const searchText = [project.title, brief.product, brief.business, brief.platform, brief.audience].filter(Boolean).join(" ");
+    const searchText = [project.track === "drama" ? "短剧 漫剧" : "品牌营销视频", project.title, brief.product, brief.business, brief.platform, brief.audience].filter(Boolean).join(" ");
     return `<article class="record-card" data-record-card data-complete="${status.complete}" data-search-text="${escapeHTML(searchText)}">
       <header class="record-card-heading">
-        <div><p class="section-kicker">${escapeHTML(brief.platform || "创作流程")} · ${escapeHTML(brief.duration_seconds || "—")} 秒</p>
+        <div><p class="section-kicker">${escapeHTML(project.track === "drama" ? "短剧 / 漫剧" : "品牌营销视频")} · ${escapeHTML(brief.platform || "创作流程")} · ${escapeHTML(brief.duration_seconds || "—")} 秒</p>
           <h2>${escapeHTML(project.title || "未命名制作")}</h2></div>
         <span class="record-status ${status.complete ? "is-complete" : ""}">${escapeHTML(status.label)}</span>
       </header>
@@ -722,7 +795,7 @@ function renderProductionRecords() {
       <button class="button button-primary" id="records-new-workflow" type="button">新建创作流程 <span aria-hidden="true">↗</span></button>
     </header>
     ${records.length ? `<div class="record-toolbar">
-      <label class="record-search" for="record-search"><span class="sr-only">搜索制作记录</span><span aria-hidden="true">⌕</span><input id="record-search" type="search" placeholder="搜索项目名称、产品或业务" /></label>
+      <label class="record-search" for="record-search"><span class="sr-only">搜索制作记录</span><span aria-hidden="true">⌕</span><input id="record-search" type="search" placeholder="搜索项目名称、故事设定或业务" /></label>
       <div class="record-toolbar-meta"><span id="record-count"></span>
         <div class="record-filters" role="group" aria-label="筛选制作记录">
           <button type="button" data-record-filter="all" aria-pressed="${state.recordFilter === "all"}">全部</button>
@@ -734,7 +807,7 @@ function renderProductionRecords() {
     <div class="records-grid">${cards}</div>
     <p id="record-filter-empty" class="record-filter-empty" hidden>没有符合条件的制作记录。</p>`
       : `<div class="records-empty"><span class="records-empty-mark" aria-hidden="true">▤</span><h2>还没有制作记录</h2>
-        <p>创建创作流程后，确认过的脚本、分镜和生成的成片都会保存在这里。</p>
+        <p>创建创作流程后，确认过的脚本、分镜、逐镜片段和 AI 剪辑方案都会保存在这里。</p>
         <button class="button button-primary" id="records-new-workflow" type="button">创建第一个项目 <span aria-hidden="true">↗</span></button></div>`}
   </section>`;
 
@@ -804,7 +877,7 @@ function renderProductionRecordDetail(project) {
   workspace.innerHTML = `<section class="record-detail" aria-labelledby="record-detail-title">
     <div class="record-detail-nav"><button class="record-back-button" id="back-to-records" type="button"><span aria-hidden="true">←</span> 返回制作记录</button>
       <button class="button button-subtle" id="continue-production" type="button">打开创作流程</button></div>
-    <header class="record-detail-heading"><div><p class="section-kicker">${escapeHTML(brief.platform || "创作流程")} · ${escapeHTML(brief.duration_seconds || "—")} 秒 · 创建于 ${escapeHTML(recordDate(project.created_at))}</p>
+    <header class="record-detail-heading"><div><p class="section-kicker">${escapeHTML(project.track === "drama" ? "短剧 / 漫剧" : "品牌营销视频")} · ${escapeHTML(brief.platform || "创作流程")} · ${escapeHTML(brief.duration_seconds || "—")} 秒 · 创建于 ${escapeHTML(recordDate(project.created_at))}</p>
       <h1 id="record-detail-title">${escapeHTML(project.title || "未命名制作")}</h1>
       <p>${escapeHTML(brief.business || "创作项目")}${brief.audience ? ` · 面向 ${escapeHTML(brief.audience)}` : ""}</p></div>
       <span class="record-status ${productionState(project).complete ? "is-complete" : ""}">${escapeHTML(productionState(project).label)}</span></header>
