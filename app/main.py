@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -371,6 +371,19 @@ def create_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
+    @application.get("/api/projects/{project_id}/chat/history")
+    def chat_history_page(
+        project_id: str,
+        limit: int = Query(default=10, ge=1, le=100),
+        before: str | None = Query(default=None, max_length=128),
+    ) -> dict:
+        try:
+            return chat.history_page(project_id, limit=limit, before=before)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     @application.post("/api/projects/{project_id}/chat")
     def send_chat(project_id: str, payload: ChatRequest) -> list[dict]:
         try:
@@ -397,7 +410,7 @@ def create_app(
                 )
                 events.put({
                     "type": "done",
-                    "messages": chat.history(project_id),
+                    "messages": chat.history(project_id, limit=10),
                     "project": workflow.get_project(project_id),
                 })
             except KeyError as error:

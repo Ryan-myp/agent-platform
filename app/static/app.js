@@ -9,6 +9,9 @@ const state = {
   selectedModel: null,
   modelDeletePending: null,
   chatMessages: [],
+  chatHasMore: false,
+  chatHistoryCursor: null,
+  chatLoadingOlder: false,
   chatSending: false,
   recordFilter: "all",
   viewMode: "new",
@@ -358,6 +361,9 @@ function renderWorkflowSetup() {
   state.project = null;
   state.viewStage = null;
   state.chatMessages = [];
+  state.chatHasMore = false;
+  state.chatHistoryCursor = null;
+  state.chatLoadingOlder = false;
   state.viewMode = "workflow-setup";
   workspace.classList.remove("chat-workspace");
   document.querySelector("#top-title").textContent = "创作流程";
@@ -961,6 +967,9 @@ async function showProductionRecords() {
   state.project = null;
   state.viewStage = null;
   state.chatMessages = [];
+  state.chatHasMore = false;
+  state.chatHistoryCursor = null;
+  state.chatLoadingOlder = false;
   showNotice("");
   renderProjects();
   renderProductionRecords();
@@ -1177,16 +1186,84 @@ function renderChatMessage(item) {
   </article>`;
 }
 
-function renderChat() {
+function renderChat({ preserveScroll = null } = {}) {
   const container = document.querySelector("#chat-messages");
+  if (!container) return;
   const messages = state.chatMessages.filter((item) => !item.internal && item.role !== "tool");
-  if (!messages.length) {
-    container.innerHTML = `<div class="chat-empty"><span class="chat-empty-mark" aria-hidden="true">✳</span>
+  const loadOlder = state.chatHasMore
+    ? `<button type="button" id="load-older-chat" class="chat-load-older" ${state.chatLoadingOlder ? "disabled" : ""}>${state.chatLoadingOlder ? "正在加载…" : "加载更早消息"}</button>`
+    : "";
+  const content = messages.length
+    ? messages.map(renderChatMessage).join("")
+    : `<div class="chat-empty"><span class="chat-empty-mark" aria-hidden="true">✳</span>
       <h3>从一句话开始</h3><p>聊脚本、改方向，或直接说“生成一张……图片”“帮我生成一个 5 秒短视频”。</p></div>`;
+  container.innerHTML = `${loadOlder}${content}`;
+  if (preserveScroll) {
+    const targetScrollTop = preserveScroll.scrollTop + container.scrollHeight - preserveScroll.scrollHeight;
+    const previousBehavior = container.style.scrollBehavior;
+    container.style.scrollBehavior = "auto";
+    container.scrollTop = targetScrollTop;
+    requestAnimationFrame(() => { container.style.scrollBehavior = previousBehavior; });
   } else {
-    container.innerHTML = messages.map(renderChatMessage).join("");
+    container.scrollTop = container.scrollHeight;
   }
-  container.scrollTop = container.scrollHeight;
+}
+
+async function loadOlderChatMessages() {
+  if (!state.project || !state.chatHasMore || !state.chatHistoryCursor || state.chatLoadingOlder) return;
+  const projectId = state.project.id;
+  const cursor = state.chatHistoryCursor;
+  const container = document.querySelector("#chat-messages");
+  const preserveScroll = {
+    scrollTop: container.scrollTop,
+    scrollHeight: container.scrollHeight,
+  };
+  const button = document.querySelector("#load-older-chat");
+  state.chatLoadingOlder = true;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在加载…";
+  }
+  let loaded = false;
+  try {
+    const page = await api(
+      `/api/projects/${encodeURIComponent(projectId)}/chat/history?limit=10&before=${encodeURIComponent(cursor)}`,
+    );
+    if (state.project?.id !== projectId || state.viewMode !== "chat") return;
+    const existingIds = new Set(state.chatMessages.map((item) => item.id));
+    state.chatMessages = [
+      ...page.messages.filter((item) => !existingIds.has(item.id)),
+      ...state.chatMessages,
+    ];
+    state.chatHasMore = Boolean(page.has_more);
+    state.chatHistoryCursor = page.next_cursor || null;
+    loaded = true;
+  } catch (error) {
+    if (state.project?.id === projectId) showNotice(error.message, true);
+  } finally {
+    state.chatLoadingOlder = false;
+    if (loaded && state.project?.id === projectId && state.viewMode === "chat") {
+      renderChat({ preserveScroll });
+    } else if (!loaded && state.project?.id === projectId) {
+      const currentButton = document.querySelector("#load-older-chat");
+      if (currentButton) {
+        currentButton.disabled = false;
+        currentButton.textContent = "加载更早消息";
+      }
+    }
+  }
+}
+
+function mergeChatMessages(existing, incoming) {
+  const messagesById = new Map();
+  for (const item of existing) {
+    if (!String(item.id || "").startsWith("local-")) messagesById.set(item.id, item);
+  }
+  for (const item of incoming) messagesById.set(item.id, item);
+  return [...messagesById.values()].sort((left, right) => {
+    const timeOrder = String(left.created_at || "").localeCompare(String(right.created_at || ""));
+    return timeOrder || String(left.id || "").localeCompare(String(right.id || ""));
+  });
 }
 
 function updateStreamingMessage(message) {
@@ -1227,6 +1304,9 @@ function renderChatScreen({ preserveDraft = false } = {}) {
       </div>
     </section>`;
   renderChat();
+  document.querySelector("#chat-messages").addEventListener("click", (event) => {
+    if (event.target.closest("#load-older-chat")) loadOlderChatMessages();
+  });
   if (draft) document.querySelector("#chat-input").value = draft;
   document.querySelector("#chat-form").addEventListener("submit", sendChat);
   document.querySelector("#chat-input").addEventListener("keydown", (event) => {
@@ -1240,7 +1320,11 @@ function renderChatScreen({ preserveDraft = false } = {}) {
 async function openChat() {
   if (!state.project) return;
   try {
-    state.chatMessages = await api(`/api/projects/${state.project.id}/chat`);
+    const page = await api(`/api/projects/${encodeURIComponent(state.project.id)}/chat/history?limit=10`);
+    state.chatMessages = page.messages || [];
+    state.chatHasMore = Boolean(page.has_more);
+    state.chatHistoryCursor = page.next_cursor || null;
+    state.chatLoadingOlder = false;
     showNotice("");
     renderChatScreen();
   } catch (error) {
@@ -1298,7 +1382,7 @@ async function sendChat(event) {
   const message = input.value.trim();
   if (!message) return;
 
-  const previousUserCount = state.chatMessages.filter((item) => item.role === "user").length;
+  const sendStartedAt = Date.now();
   const localId = `local-${crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
   const userMessage = { id: localId, role: "user", content: message };
   const assistantMessage = { id: `${localId}-reply`, role: "assistant", content: "", pending: true };
@@ -1336,7 +1420,7 @@ async function sendChat(event) {
         updateStreamingMessage(assistantMessage);
       } else if (streamEvent.type === "done") {
         completed = true;
-        state.chatMessages = streamEvent.messages || [];
+        state.chatMessages = mergeChatMessages(state.chatMessages, streamEvent.messages || []);
         state.project = streamEvent.project || state.project;
         renderChat();
         document.querySelector("#top-title").textContent = state.project.title;
@@ -1348,17 +1432,25 @@ async function sendChat(event) {
     status.textContent = error.message;
     try {
       if (state.project) {
-        const history = await api(`/api/projects/${encodeURIComponent(state.project.id)}/chat`);
-        state.project = await api(`/api/projects/${encodeURIComponent(state.project.id)}`);
+        const projectId = state.project.id;
+        const page = await api(`/api/projects/${encodeURIComponent(projectId)}/chat/history?limit=10`);
+        const history = page.messages || [];
+        state.project = await api(`/api/projects/${encodeURIComponent(projectId)}`);
         await refreshProjects();
-        const userCount = history.filter((item) => item.role === "user").length;
-        if (userCount > previousUserCount) {
-          state.chatMessages = [...history, {
+        const userWasSaved = history.some((item) =>
+          item.role === "user" && item.content === message && Date.parse(item.created_at || "") >= sendStartedAt - 5000,
+        );
+        state.chatMessages = mergeChatMessages(state.chatMessages, history);
+        if (userWasSaved) {
+          state.chatMessages.push({
             id: `${localId}-error`, role: "assistant", content: `请求未完成：${error.message}`, failed: true,
-          }];
-        } else {
-          state.chatMessages = history;
-          if (!input.value.trim()) input.value = message;
+          });
+        } else if (!input.value.trim()) {
+          input.value = message;
+        }
+        if (!state.chatHasMore) {
+          state.chatHasMore = Boolean(page.has_more);
+          state.chatHistoryCursor = page.next_cursor || null;
         }
         renderChat();
       } else {
@@ -1657,6 +1749,9 @@ async function initialize() {
       state.project = null;
       state.viewStage = null;
       state.chatMessages = [];
+      state.chatHasMore = false;
+      state.chatHistoryCursor = null;
+      state.chatLoadingOlder = false;
       showNotice("");
       renderChatScreen();
       renderProjects();

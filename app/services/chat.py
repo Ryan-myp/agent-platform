@@ -81,10 +81,21 @@ class ChatService:
         self.settings = settings
         self.assets = assets
 
-    def history(self, project_id: str) -> list[dict[str, Any]]:
+    def history(self, project_id: str, limit: int = 50) -> list[dict[str, Any]]:
         if not self.store.get(project_id):
             raise KeyError("找不到这个创作项目。")
-        return self.store.chat_history(project_id)
+        return self.store.chat_history(project_id, limit=limit)
+
+    def history_page(
+        self,
+        project_id: str,
+        *,
+        limit: int = 10,
+        before: str | None = None,
+    ) -> dict[str, Any]:
+        if not self.store.get(project_id):
+            raise KeyError("找不到这个创作项目。")
+        return self.store.chat_history_page(project_id, limit=limit, before_id=before)
 
     def send(
         self,
@@ -113,10 +124,10 @@ class ChatService:
         self._save(project_id, {"role": "user", "content": message_text})
         api_key = self.settings.api_key_for(profile)
         provider = create_text_provider(profile, api_key)
-        history = self.store.chat_history(project_id)
+        history = self.store.chat_history(project_id, limit=30)
         context = self._context(project)
         messages: list[dict[str, Any]] = [{"role": "system", "content": context}]
-        messages.extend(self._provider_messages(history[-30:]))
+        messages.extend(self._provider_messages(history))
         if on_event:
             on_event({"type": "status", "message": f"正在连接 {profile.name}…"})
         result = self._request_chat(provider, messages, on_event)

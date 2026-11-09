@@ -55,6 +55,10 @@ class ProjectStore:
                 )"""
             )
             connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_messages_project_created_id "
+                "ON chat_messages(project_id, created_at DESC, id DESC)"
+            )
+            connection.execute(
                 """CREATE TABLE IF NOT EXISTS video_jobs (
                     id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
@@ -246,7 +250,48 @@ class ProjectStore:
     def chat_history(self, project_id: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT payload FROM chat_messages WHERE project_id = ? ORDER BY created_at DESC LIMIT ?",
+                """SELECT payload FROM chat_messages
+                   WHERE project_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
                 (project_id, limit),
             ).fetchall()
         return [json.loads(row["payload"]) for row in reversed(rows)]
+
+    def chat_history_page(
+        self,
+        project_id: str,
+        *,
+        limit: int = 10,
+        before_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not 1 <= limit <= 100:
+            raise ValueError("每页聊天记录数量必须在 1–100 之间。")
+        with self._connection() as connection:
+            if before_id:
+                cursor = connection.execute(
+                    "SELECT created_at, id FROM chat_messages WHERE project_id = ? AND id = ?",
+                    (project_id, before_id),
+                ).fetchone()
+                if cursor is None:
+                    raise ValueError("聊天记录游标无效，请重新打开对话。")
+                rows = connection.execute(
+                    """SELECT id, payload FROM chat_messages
+                       WHERE project_id = ?
+                         AND (created_at < ? OR (created_at = ? AND id < ?))
+                       ORDER BY created_at DESC, id DESC LIMIT ?""",
+                    (project_id, cursor["created_at"], cursor["created_at"], cursor["id"], limit + 1),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT id, payload FROM chat_messages
+                       WHERE project_id = ?
+                       ORDER BY created_at DESC, id DESC LIMIT ?""",
+                    (project_id, limit + 1),
+                ).fetchall()
+        has_more = len(rows) > limit
+        messages = [json.loads(row["payload"]) for row in reversed(rows[:limit])]
+        return {
+            "messages": messages,
+            "has_more": has_more,
+            "next_cursor": messages[0]["id"] if has_more and messages else None,
+        }

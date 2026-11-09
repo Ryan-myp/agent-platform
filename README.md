@@ -62,7 +62,8 @@ AGNES_API_KEY=你的Agnes_API_Key
 - `GET /api/config/models/{profile_id}/credential`：仅 loopback 可读，供本机配置编辑器回显 API Key
 - `GET /api/projects`、`POST /api/projects`：项目列表和创作流程项目创建
 - `POST /api/chat/sessions`：创建无需 brief 的普通对话会话（首次发送消息后更新会话标题）
-- `GET /api/projects/{id}/chat`、`POST /api/projects/{id}/chat`：读取/发送持续对话消息
+- `GET /api/projects/{id}/chat`、`POST /api/projects/{id}/chat`：兼容读取/发送持续对话消息
+- `GET /api/projects/{id}/chat/history?limit=10&before={message_id}`：按游标分页读取记录；工作台初次只加载最近 10 条，需要时再向上加载更早消息
 - `POST /api/projects/{id}/chat/stream`：发送消息并通过 SSE 流式返回生成状态、文本增量和完成事件
 - `POST /api/projects/{id}/generate/{stage}`：生成当前阶段草稿（逐镜模式的视频阶段不支持整段生成）
 - `PUT /api/projects/{id}/content/{stage}`、`POST /api/projects/{id}/approve/{stage}`：修改和确认当前草稿

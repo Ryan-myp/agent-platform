@@ -14,12 +14,12 @@
 - `app/providers/text.py`：统一文本 Provider 协议、OpenAI-compatible Chat Completions / 工具调用适配器及 Anthropic Claude SDK 适配器。
 - `app/providers/media.py`：图像、视频、音频 Provider 和本地媒体资源保存。当前包括 Agnes 图像、拆分提交与查询的 Agnes 视频适配器，以及 OpenAI-compatible 语音/转写适配器。
 - `app/skills/loader.py`：扫描本地 `skills/<skill-id>/SKILL.md`，按创作类型与阶段加载 Markdown，并仅内联 frontmatter 显式列出的同目录参考文件；缺少 `tracks` 的旧 Skills 仅按营销路线加载；不执行 Skill 文件代码。
-- `app/store.py`：SQLite 项目、聊天消息和逐镜视频任务持久化；项目状态和新视频任务在同一事务写入。后续可替换为 Postgres 实现。
-- `app/static/`：无构建步骤的工作台 UI，含独立的“新对话”和“创作流程”入口、原生 `<dialog>` 模型配置管理、逐步确认界面。聊天发送采用乐观用户消息和 SSE 文本增量更新；助手回复和工作流只读内容安全渲染 Markdown，用户消息保持纯文本。
+- `app/store.py`：SQLite 项目、聊天消息和逐镜视频任务持久化；聊天记录按 `(project_id, created_at, id)` 建索引并用 keyset 游标分页，避免长对话每次扫描/返回全部消息；项目状态和新视频任务在同一事务写入。后续可替换为 Postgres 实现。
+- `app/static/`：无构建步骤的工作台 UI，含独立的“新对话”和“创作流程”入口、原生 `<dialog>` 模型配置管理、逐步确认界面。聊天首屏只读最近 10 条，用户可按需向上加载更早记录；分页插入后保留当前阅读位置。聊天发送采用乐观用户消息和 SSE 文本增量更新；助手回复和工作流只读内容安全渲染 Markdown，用户消息保持纯文本。
 
 ## 对话和媒体流程
 
-1. 新对话首次发送消息前由前端调用 `POST /api/chat/sessions` 创建 `mode=chat` 会话；它不要求 brief，首条用户消息会成为会话标题。创作流程由 `POST /api/projects` 创建 `mode=workflow` 项目。随后两种模式都通过 `POST /api/projects/{id}/chat/stream` 发送消息：用户消息先在界面显示，服务通过 SSE 返回状态和文本增量；普通聊天使用不含 brief 的上下文，工作流会话使用项目 brief 与已确认阶段内容。兼容的 `POST /api/projects/{id}/chat` JSON 接口仍保留。
+1. 新对话首次发送消息前由前端调用 `POST /api/chat/sessions` 创建 `mode=chat` 会话；它不要求 brief，首条用户消息会成为会话标题。创作流程由 `POST /api/projects` 创建 `mode=workflow` 项目。打开对话时前端调用 `GET /api/projects/{id}/chat/history?limit=10` 读取最近记录；`before` 游标可取前一页，消息按时间正序返回。随后两种模式都通过 `POST /api/projects/{id}/chat/stream` 发送消息：用户消息先在界面显示，服务通过 SSE 返回状态和文本增量；普通聊天使用不含 brief 的上下文，工作流会话使用项目 brief 与已确认阶段内容。兼容的 `GET/POST /api/projects/{id}/chat` 接口仍保留。
 2. 文本模型可调用图片、视频、语音生成工具；工具结果以附件形式保存并显示在对话里。没有 Provider 成功结果时，不得声称媒体已生成。
 3. 图像和音频请求当前在聊天 HTTP 请求中同步完成。结构化工作流的逐镜视频任务写入 SQLite 后由单进程后台 Worker 提交和轮询；入队接口返回 HTTP 202，项目状态包含本地任务 ID、供应商任务 ID和状态，前端定时刷新。轮询失败采用有上限的退避重试。服务重启后可按已持久化的供应商任务 ID继续轮询；若进程在提交期间中断或响应无法确认，任务会标为“提交结果待核对”，不会自动重发，必须由用户核对供应商任务后明确确认重试。旧式 Provider 和聊天内媒体工具仍保持同步兼容。
 4. Agnes Video 2.5 Flash 单次支持 4–12 秒；当前没有多段视频拼接。超出单次范围的项目会收到错误，不会被伪装成完整成片。已知 `video_queue_full` 错误会以可操作提示保留供应商请求 ID；平台不会自动重复提交。

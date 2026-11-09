@@ -613,6 +613,36 @@ def test_plain_chat_session_needs_no_brief_and_titles_from_first_message(tmp_pat
     assert "项目 brief：" not in captured["context"]
 
 
+def test_chat_history_pages_from_latest_to_older_without_duplicates(tmp_path):
+    client = make_client(tmp_path)
+    project = new_project(client).json()
+    store = client.app.state.chat.store
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for index in range(7):
+        store.append_chat_message(project["id"], {
+            "id": f"message-{index}",
+            "created_at": base.replace(microsecond=index).isoformat(),
+            "role": "user",
+            "content": f"消息 {index}",
+        })
+
+    first = client.get(f"/api/projects/{project['id']}/chat/history?limit=3").json()
+    second = client.get(
+        f"/api/projects/{project['id']}/chat/history?limit=3&before={first['next_cursor']}"
+    ).json()
+    third = client.get(
+        f"/api/projects/{project['id']}/chat/history?limit=3&before={second['next_cursor']}"
+    ).json()
+
+    assert [item["id"] for item in first["messages"]] == ["message-4", "message-5", "message-6"]
+    assert [item["id"] for item in second["messages"]] == ["message-1", "message-2", "message-3"]
+    assert [item["id"] for item in third["messages"]] == ["message-0"]
+    assert first["has_more"] is True
+    assert second["has_more"] is True
+    assert third["has_more"] is False
+    assert third["next_cursor"] is None
+
+
 def test_unconfigured_real_provider_fails_without_faking_content(tmp_path):
     client = make_client(tmp_path, api_keys={})
     project = new_project(client).json()

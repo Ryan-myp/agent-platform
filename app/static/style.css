@@ -298,6 +298,9 @@ h1, h2, p { margin-top: 0; }
 .dialog-close:hover { background: #edf0e9; }
 .chat-screen { height: 100%; min-height: 0; display: flex; flex-direction: column; background: #fff; }
 .chat-messages { flex: 1 1 auto; min-height: 0; width: min(1480px, 100%); margin: 0 auto; overflow: auto; display: flex; flex-direction: column; gap: 20px; padding: 25px clamp(22px, 4vw, 48px); scroll-behavior: smooth; }
+.chat-load-older { align-self: center; border: 1px solid var(--line); border-radius: 999px; background: #fff; color: var(--muted); padding: 7px 13px; font: inherit; font-size: 12px; cursor: pointer; }
+.chat-load-older:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-dark); }
+.chat-load-older:disabled { cursor: wait; opacity: .65; }
 .chat-empty { margin: auto; max-width: 420px; padding: 28px 10px; text-align: center; }
 .chat-empty-mark { display: grid; place-items: center; width: 42px; height: 42px; margin: 0 auto 13px; border-radius: 50%; background: #f4ead9; color: #9a6525; font-size: 20px; }
 .chat-empty h3 { margin: 0 0 7px; font-size: 16px; }
