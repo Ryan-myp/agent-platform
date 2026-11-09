@@ -7,6 +7,7 @@ import queue
 import re
 import tempfile
 import threading
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from app.providers.catalog import MODALITIES, SUPPORTED_ADAPTERS, ModelCatalog, 
 from app.providers.credentials import ModelCredentialStore
 from app.services.chat import ChatService
 from app.services.workflow import WorkflowError, WorkflowService
+from app.services.video_jobs import VideoJobWorker
 from app.skills.loader import SkillLoader
 from app.store import ProjectStore
 
@@ -150,17 +152,29 @@ def create_app(
     media_path = current_settings.database_path.parent / "media"
     assets = AssetStore(media_path)
     workflow = WorkflowService(store, current_settings, skill_loader, video_provider, image_provider, assets)
+    video_job_worker = VideoJobWorker(workflow, store)
+    workflow.video_job_worker = video_job_worker
     chat = ChatService(store, current_settings, assets)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        video_job_worker.start()
+        try:
+            yield
+        finally:
+            video_job_worker.stop()
 
     application = FastAPI(
         title="片场 · AI 视频创作台",
         version="0.2.0",
         description="支持多供应商多模态模型与对话式创作的内容平台。",
+        lifespan=lifespan,
     )
     application.state.workflow = workflow
     application.state.chat = chat
     application.state.assets = assets
     application.state.model_credentials = credential_store
+    application.state.video_job_worker = video_job_worker
     catalog_update_lock = threading.Lock()
 
     @application.exception_handler(RequestValidationError)
@@ -320,9 +334,23 @@ def create_app(
     def generate_shot_image(project_id: str, shot_id: str) -> dict:
         return run(workflow.generate_shot_image, project_id, shot_id)
 
-    @application.post("/api/projects/{project_id}/shots/{shot_id}/video")
-    def generate_shot_video(project_id: str, shot_id: str) -> dict:
-        return run(workflow.generate_shot_video, project_id, shot_id)
+    @application.post("/api/projects/{project_id}/shots/{shot_id}/video", response_model=None)
+    def generate_shot_video(
+        project_id: str, shot_id: str, confirm_uncertain: bool = False
+    ) -> dict | JSONResponse:
+        result = run(
+            workflow.generate_shot_video,
+            project_id,
+            shot_id,
+            confirm_uncertain=confirm_uncertain,
+        )
+        shot = next(
+            item for item in result["workflow"]["video"]["shots"]
+            if item.get("shot_id") == shot_id
+        )
+        if shot.get("video", {}).get("status") == "queued":
+            return JSONResponse(status_code=202, content=result)
+        return result
 
     @application.put("/api/projects/{project_id}/content/{stage}")
     def update_content(project_id: str, stage: str, payload: ContentUpdate) -> dict:

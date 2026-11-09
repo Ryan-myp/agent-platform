@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 import re
 import threading
 from urllib.parse import urlparse
@@ -15,11 +17,12 @@ from app.providers.media import (
     ImageProvider,
     MediaProviderError,
     VideoProvider,
+    VideoSubmissionUncertainError,
     create_image_provider,
 )
 from app.providers.text import create_text_provider
 from app.stages import STAGE_IDS, STAGES, TRACK_INSTRUCTIONS, TRACK_LABELS, TRACK_STAGE_INSTRUCTIONS
-from app.store import ProjectStore
+from app.store import ProjectStore, VideoJobConflict
 from app.skills.loader import SkillLoader
 from app.services.production import (
     ScenePlanError,
@@ -69,6 +72,7 @@ class WorkflowService:
         self.assets = assets or AssetStore(settings.database_path.parent / "media")
         self._media_jobs_lock = threading.Lock()
         self._active_media_jobs: set[tuple[str, str, str]] = set()
+        self.video_job_worker = None
 
     def create_project(self, data: dict) -> dict:
         mode = data.pop("mode", "workflow")
@@ -522,8 +526,323 @@ class WorkflowService:
     def generate_shot_image(self, project_id: str, shot_id: str) -> dict:
         return self._generate_shot_asset(project_id, shot_id, "image")
 
-    def generate_shot_video(self, project_id: str, shot_id: str) -> dict:
-        return self._generate_shot_asset(project_id, shot_id, "video")
+    def _video_job_request(self, project: dict, shot: dict) -> dict:
+        image_asset = shot.get("image") or {}
+        image_url = image_asset.get("asset_url") or "" if image_asset.get("status") == "ready" else ""
+        parsed_image_url = urlparse(image_url)
+        references = [image_url] if parsed_image_url.scheme in {"http", "https"} and parsed_image_url.hostname else []
+        return {
+            "brief": {**project.get("brief", {}), "duration_seconds": shot["duration_seconds"]},
+            "video_prompt": shot["video_prompt"],
+            "aspect_ratio": shot["aspect_ratio"],
+            "reference_images": references,
+        }
+
+    @staticmethod
+    def _video_request_signature(request: dict) -> str:
+        canonical = json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _refresh_video_stage_status(self, project: dict) -> None:
+        video = project.get("workflow", {}).setdefault("video", {})
+        shots = video.get("shots", [])
+        for shot in shots:
+            shot["stale"] = any(
+                (shot.get(kind) or {}).get("status") == "stale"
+                for kind in ("image", "video")
+            )
+        statuses = [(shot.get("video") or {}).get("status", "pending") for shot in shots]
+        asset_statuses = [
+            (shot.get(kind) or {}).get("status", "pending")
+            for shot in shots
+            for kind in ("image", "video")
+        ]
+        if "stale" in asset_statuses:
+            video["status"] = "stale"
+        elif statuses and all(status == "ready" for status in statuses):
+            video["status"] = "ready"
+        elif any(status != "pending" for status in statuses):
+            video["status"] = "partial"
+        else:
+            video["status"] = "pending"
+
+    def _update_video_job(
+        self,
+        job: dict,
+        updates: dict,
+        *,
+        asset_updates: dict | None = None,
+    ) -> dict:
+        project = self.store.get(job["project_id"])
+        should_save_project = False
+        if project is not None and asset_updates is not None:
+            video = project.get("workflow", {}).get("video", {})
+            shot = next(
+                (item for item in video.get("shots", []) if item.get("shot_id") == job["shot_id"]),
+                None,
+            )
+            asset = (shot or {}).get("video") or {}
+            if shot is not None and asset.get("job_id") == job["id"]:
+                asset.update(asset_updates)
+                self._refresh_video_stage_status(project)
+                project["updated_at"] = now_iso()
+                should_save_project = True
+        return self.store.update_video_job(
+            job["id"], updates, project=project if should_save_project else None
+        )
+
+    def _fail_video_job(self, job: dict, message: str) -> None:
+        error = str(message)[:1000]
+        self._update_video_job(
+            job,
+            {"status": "failed", "error": error, "next_poll_at": None},
+            asset_updates={"status": "failed", "completed_at": now_iso(), "error": error},
+        )
+
+    def _mark_video_job_interrupted(self, job: dict, message: str) -> None:
+        error = str(message)[:1000]
+        self._update_video_job(
+            job,
+            {"status": "interrupted", "error": error, "next_poll_at": None},
+            asset_updates={
+                "status": "interrupted",
+                "completed_at": now_iso(),
+                "error": error,
+            },
+        )
+
+    def _defer_video_job_poll(self, job: dict, message: str) -> None:
+        failures = int(job.get("poll_failures", 0)) + 1
+        delay_seconds = min(5 * (2 ** min(failures - 1, 4)), 60)
+        next_poll = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat()
+        self._update_video_job(
+            job,
+            {
+                "status": "polling",
+                "poll_failures": failures,
+                "last_poll_error": str(message)[:1000],
+                "next_poll_at": next_poll,
+            },
+            asset_updates={"provider_status": "查询暂时失败，稍后自动重试"},
+        )
+
+    def _submit_video_job(self, job: dict) -> None:
+        try:
+            provider = self._get_video_provider()
+        except WorkflowError as exc:
+            self._fail_video_job(job, str(exc))
+            return
+        try:
+            task = provider.submit_video(project=job["request"])
+        except VideoSubmissionUncertainError as exc:
+            self._mark_video_job_interrupted(job, str(exc))
+            return
+        except MediaProviderError as exc:
+            self._fail_video_job(job, str(exc))
+            return
+        except Exception:
+            self._mark_video_job_interrupted(
+                job,
+                "视频任务提交时发生异常，供应商是否已受理未知。请先核对供应商任务，再决定是否重试。",
+            )
+            return
+        provider_task_id = task.get("provider_task_id") if isinstance(task, dict) else None
+        if not provider_task_id:
+            self._mark_video_job_interrupted(
+                job,
+                "供应商响应中没有可用于查询的任务 ID，任务是否已受理未知。请核对供应商任务后再决定是否重试。",
+            )
+            return
+        task_id = str(task.get("task_id") or provider_task_id)
+        next_poll = (datetime.now(timezone.utc) + timedelta(seconds=3)).isoformat()
+        self._update_video_job(
+            job,
+            {
+                "status": "polling",
+                "provider_task_id": str(provider_task_id),
+                "task_id": task_id,
+                "provider_status": "submitted",
+                "poll_failures": 0,
+                "next_poll_at": next_poll,
+                "error": None,
+            },
+            asset_updates={
+                "status": "generating",
+                "task_id": task_id,
+                "provider_status": "已提交，等待供应商处理",
+                "error": None,
+            },
+        )
+
+    def _poll_video_job(self, job: dict) -> None:
+        provider_task_id = job.get("provider_task_id")
+        if not provider_task_id:
+            self._mark_video_job_interrupted(
+                job,
+                "本地记录缺少供应商任务 ID，无法安全恢复查询。请核对供应商任务后再决定是否重试。",
+            )
+            return
+        try:
+            provider = self._get_video_provider()
+            result = provider.poll_video(provider_task_id=provider_task_id)
+        except Exception as exc:
+            self._defer_video_job_poll(job, str(exc) or "查询视频任务暂时失败。")
+            return
+        status = result.get("status") if isinstance(result, dict) else None
+        if status == "completed" and result.get("asset_url"):
+            self._complete_video_job(job, result)
+            return
+        if status == "failed":
+            self._fail_video_job(job, result.get("error") or "供应商报告视频任务失败。")
+            return
+        now = datetime.now(timezone.utc)
+        delay = 5 if status == "queued" else 10
+        self._update_video_job(
+            job,
+            {
+                "status": "polling",
+                "provider_status": str(result.get("provider_status") or status or "processing")[:100],
+                "poll_failures": 0,
+                "last_poll_error": None,
+                "next_poll_at": (now + timedelta(seconds=delay)).isoformat(),
+            },
+            asset_updates={
+                "status": "generating",
+                "provider_status": str(result.get("provider_status") or status or "processing")[:100],
+            },
+        )
+
+    def _complete_video_job(self, job: dict, result: dict) -> None:
+        project = self.store.get(job["project_id"])
+        asset_url = str(result["asset_url"])
+        completed_at = now_iso()
+        project_to_save = None
+        if project is not None:
+            video = project.get("workflow", {}).get("video", {})
+            shot = next(
+                (item for item in video.get("shots", []) if item.get("shot_id") == job["shot_id"]),
+                None,
+            )
+            asset = (shot or {}).get("video") or {}
+            if shot is not None and asset.get("job_id") == job["id"]:
+                current_request = self._video_job_request(project, shot)
+                stale = (
+                    self._video_request_signature(current_request) != job.get("input_signature")
+                    or asset.get("status") == "stale"
+                    or shot.get("stale", False)
+                )
+                task_id = job.get("task_id") or job.get("provider_task_id")
+                version = {
+                    "version": len(asset.get("versions", [])) + 1,
+                    "asset_url": asset_url,
+                    "model": job.get("model"),
+                    "requested_at": asset.get("requested_at"),
+                    "completed_at": completed_at,
+                    "task_id": task_id,
+                    "job_id": job["id"],
+                    "cost": None,
+                    "stale": stale,
+                }
+                asset.setdefault("versions", []).append(version)
+                asset.update({
+                    "asset_url": asset_url,
+                    "completed_at": completed_at,
+                    "task_id": task_id,
+                    "cost": None,
+                    "error": None,
+                    "provider_status": "completed",
+                    "status": "stale" if stale else "ready",
+                })
+                if stale:
+                    asset["stale_reason"] = "生成期间镜头任务或参考素材已修改；此片段已保留为过期版本。"
+                else:
+                    asset.pop("stale_status", None)
+                    asset.pop("stale_reason", None)
+                self._refresh_video_stage_status(project)
+                project["updated_at"] = completed_at
+                project_to_save = project
+        self.store.update_video_job(
+            job["id"],
+            {
+                "status": "completed",
+                "provider_status": "completed",
+                "result_url": asset_url,
+                "completed_at": completed_at,
+                "next_poll_at": None,
+                "last_poll_error": None,
+            },
+            project=project_to_save,
+        )
+
+    def generate_shot_video(
+        self, project_id: str, shot_id: str, *, confirm_uncertain: bool = False
+    ) -> dict:
+        project = self.get_project(project_id)
+        shot = self._get_shot(project, shot_id)
+        provider = self._get_video_provider()
+        supports_durable_tasks = callable(getattr(provider, "submit_video", None)) and callable(
+            getattr(provider, "poll_video", None)
+        )
+        if not supports_durable_tasks or self.video_job_worker is None:
+            return self._generate_shot_asset(project_id, shot_id, "video")
+
+        latest = self.store.latest_video_job(project_id, shot_id)
+        if latest and latest.get("status") in {"queued", "submitting", "polling"}:
+            raise WorkflowError("这个镜头已有正在处理的视频任务，请等待当前任务完成。", 409)
+        if latest and latest.get("status") == "interrupted":
+            if not confirm_uncertain:
+                raise WorkflowError(
+                    "上一次提交结果未知。请先核对供应商任务；确认没有仍在处理的任务后，再选择“核对后重试”。",
+                    409,
+                )
+            self.store.update_video_job(
+                latest["id"],
+                {"status": "abandoned", "resolved_at": now_iso()},
+            )
+
+        request = self._video_job_request(project, shot)
+        created = now_iso()
+        job_id = str(uuid4())
+        profile_id = self.settings.model_catalog.defaults.get("video") or "injected-provider"
+        job = {
+            "id": job_id,
+            "project_id": project_id,
+            "shot_id": shot_id,
+            "status": "queued",
+            "model": profile_id,
+            "request": request,
+            "input_signature": self._video_request_signature(request),
+            "provider_task_id": None,
+            "task_id": None,
+            "provider_status": "queued",
+            "error": None,
+            "poll_failures": 0,
+            "created_at": created,
+            "updated_at": created,
+            "next_poll_at": None,
+        }
+        asset = shot.setdefault("video", {})
+        asset.update({
+            "status": "queued",
+            "job_id": job_id,
+            "model": profile_id,
+            "requested_at": created,
+            "completed_at": None,
+            "task_id": None,
+            "provider_status": "等待后台提交",
+            "cost": None,
+            "error": None,
+        })
+        asset.pop("stale_status", None)
+        asset.pop("stale_reason", None)
+        self._refresh_video_stage_status(project)
+        project["updated_at"] = created
+        try:
+            self.store.enqueue_video_job(project, job)
+        except VideoJobConflict as exc:
+            raise WorkflowError(str(exc), 409) from exc
+        self.video_job_worker.wake()
+        return project
 
     def update_content(self, project_id: str, stage: str, content: str) -> dict:
         if stage not in STAGE_IDS:

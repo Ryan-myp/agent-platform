@@ -67,7 +67,7 @@ AGNES_API_KEY=你的Agnes_API_Key
 - `POST /api/projects/{id}/generate/{stage}`：生成当前阶段草稿（逐镜模式的视频阶段不支持整段生成）
 - `PUT /api/projects/{id}/content/{stage}`、`POST /api/projects/{id}/approve/{stage}`：修改和确认当前草稿
 - `POST /api/projects/{id}/rollback/{stage}`：回退到已确认的前序步骤；保留后续产物并标记为过期
-- `POST /api/projects/{id}/shots/{shot_id}/image`、`POST /api/projects/{id}/shots/{shot_id}/video`：按镜头生成/重试关键帧或视频片段
+- `POST /api/projects/{id}/shots/{shot_id}/image`、`POST /api/projects/{id}/shots/{shot_id}/video`：按镜头生成/重试关键帧或视频片段；持久化视频任务入队后返回 HTTP 202，使用 `GET /api/projects/{id}` 查看状态
 - `POST /api/audio/transcriptions`：multipart 音频转写（默认使用配置的转写 profile）
 - `GET /health`：健康检查
 
@@ -84,4 +84,4 @@ OpenAPI 页面：<http://127.0.0.1:8000/docs>。
 node --check app/static/app.js
 ```
 
-自动化测试覆盖阶段确认、无凭据时不伪造结果、聊天持久化、Agnes 文本/图片/视频请求结构与异步轮询。真实网络调用需要你自己的 `AGNES_API_KEY` 或其他供应商凭据；当前环境没有配置 Agnes Key，因此尚未进行计费 API 的在线调用。
+自动化测试覆盖阶段确认、无凭据时不伪造结果、聊天持久化及视频任务提交/轮询/恢复。配置显示“已就绪”仅表示本地存在凭据，不代表供应商鉴权或生成成功。Agnes 视频服务此前返回过队列满（HTTP 503、`video_queue_full`），未返回可轮询的供应商任务 ID，因此实际任务完成流程尚未验证。真实媒体请求可能产生费用；自动化测试注入模拟 Provider，不调用真实供应商。

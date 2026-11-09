@@ -1,3 +1,6 @@
+let videoJobPollTimer = null;
+let videoJobPollInFlight = false;
+
 const state = {
   config: null,
   projects: [],
@@ -452,7 +455,10 @@ function renderScenePlanPreview(content) {
 }
 
 function assetStatusLabel(asset = {}) {
-  return ({ pending: "待生成", generating: "生成中", ready: "已生成", failed: "生成失败", stale: "需重新生成" })[asset.status] || "待生成";
+  return ({
+    pending: "待生成", queued: "后台排队中", submitting: "正在提交", generating: "生成中",
+    ready: "已生成", failed: "生成失败", interrupted: "提交结果待核对", stale: "需重新生成",
+  })[asset.status] || "待生成";
 }
 
 function renderAssetVersions(asset = {}) {
@@ -470,7 +476,7 @@ function renderVideoShot(shot) {
   const imageUrl = image.asset_url ? safeMediaUrl(image.asset_url) : "";
   const videoUrl = video.asset_url ? safeMediaUrl(video.asset_url) : "";
   const imageBusy = image.status === "generating";
-  const videoBusy = video.status === "generating";
+  const videoBusy = ["queued", "submitting", "generating"].includes(video.status);
   const imageReady = Boolean(imageUrl);
   const videoReady = Boolean(videoUrl);
   const imageConfigured = Boolean(state.config?.image_provider_ready);
@@ -500,8 +506,11 @@ function renderVideoShot(shot) {
         ${video.error ? `<p class="shot-error" role="alert">${escapeHTML(video.error)}</p>` : ""}
         ${video.stale_reason ? `<small class="shot-help">${escapeHTML(video.stale_reason)}</small>` : ""}
         ${video.status !== "pending" ? `<small class="shot-help">${video.cost == null ? "费用信息未由供应商返回" : `供应商报告费用：${escapeHTML(video.cost)}`}</small>` : ""}
+        ${video.provider_status ? `<small class="shot-help">供应商状态：${escapeHTML(video.provider_status)}</small>` : ""}
+        ${video.job_id ? `<small class="shot-help">本地任务：${escapeHTML(video.job_id)}</small>` : ""}
+        ${video.task_id ? `<small class="shot-help">供应商任务：${escapeHTML(video.task_id)}</small>` : ""}
         ${renderAssetVersions(video)}
-        <button class="button button-primary" type="button" data-shot-action="video" data-shot-id="${escapeHTML(shot.shot_id)}" ${videoBusy || !videoConfigured ? "disabled" : ""}>${videoBusy ? "正在生成…" : videoReady ? "重新生成视频片段" : video.status === "failed" ? "重试视频片段" : "生成视频片段"}</button>
+        <button class="button button-primary" type="button" data-shot-action="video" data-shot-id="${escapeHTML(shot.shot_id)}" ${videoBusy || !videoConfigured ? "disabled" : ""}>${videoBusy ? video.status === "queued" ? "后台排队中…" : video.status === "submitting" ? "正在提交…" : "视频生成中…" : video.status === "interrupted" ? "核对后重试" : videoReady ? "重新生成视频片段" : video.status === "failed" ? "重试视频片段" : "生成视频片段"}</button>
         ${!videoConfigured ? '<small class="shot-help">请先配置默认视频模型及 Key。</small>' : ""}
       </section>
     </div>
@@ -687,6 +696,37 @@ function renderProject() {
   });
   document.querySelector("#approve-stage")?.addEventListener("click", approveStage);
   document.querySelector("#save-content")?.addEventListener("click", saveContent);
+  scheduleVideoJobRefresh();
+}
+
+function hasActiveVideoJobs(project = state.project) {
+  return (project?.workflow?.video?.shots || []).some((shot) =>
+    ["queued", "submitting", "generating"].includes(shot.video?.status));
+}
+
+function scheduleVideoJobRefresh() {
+  if (!hasActiveVideoJobs() || videoJobPollTimer || videoJobPollInFlight) return;
+  const projectId = state.project.id;
+  videoJobPollTimer = setTimeout(async () => {
+    videoJobPollTimer = null;
+    if (state.project?.id !== projectId || state.viewMode !== "workflow") {
+      if (state.viewMode === "workflow") scheduleVideoJobRefresh();
+      return;
+    }
+    videoJobPollInFlight = true;
+    try {
+      const refreshedProject = await api(`/api/projects/${encodeURIComponent(projectId)}`);
+      if (state.viewMode === "workflow" && state.project?.id === projectId) {
+        state.project = refreshedProject;
+        renderProject();
+      }
+    } catch (error) {
+      if (state.project?.id === projectId) showNotice(error.message, true);
+    } finally {
+      videoJobPollInFlight = false;
+      if (state.viewMode === "workflow") scheduleVideoJobRefresh();
+    }
+  }, 2500);
 }
 
 function recordDate(value) {
@@ -1017,23 +1057,45 @@ async function generateStage() {
 }
 
 async function generateShotAsset(shotId, kind) {
+  const projectId = state.project.id;
+  const shot = state.project.workflow?.video?.shots?.find((item) => item.shot_id === shotId);
+  const confirmUncertain = kind === "video" && shot?.video?.status === "interrupted";
+  if (confirmUncertain) {
+    const confirmed = await confirmInApp({
+      title: "供应商任务状态待核对",
+      message: "上次提交没有可靠的任务 ID，任务可能已被供应商受理。请先到供应商控制台核对；只有确认没有仍在处理的任务后，才继续重试，以免重复生成或计费。",
+      confirmLabel: "我已核对，仍要重试",
+      cancelLabel: "暂不重试",
+    });
+    if (!confirmed) return;
+  }
   const button = [...workspace.querySelectorAll("[data-shot-action]")]
     .find((item) => item.dataset.shotId === shotId && item.dataset.shotAction === kind);
   if (button) {
     button.disabled = true;
-    button.textContent = kind === "image" ? "正在生成关键帧…" : "正在生成视频片段…";
+    button.textContent = kind === "image" ? "正在生成关键帧…" : "正在提交视频任务…";
   }
-  showNotice(`正在生成 ${shotId} ${kind === "image" ? "关键帧" : "视频片段"}，请稍候。`, false);
+  showNotice(`正在提交 ${shotId} ${kind === "image" ? "关键帧" : "视频片段"}任务…`, false);
   try {
-    state.project = await api(`/api/projects/${encodeURIComponent(state.project.id)}/shots/${encodeURIComponent(shotId)}/${kind}`, { method: "POST" });
+    const confirmationQuery = confirmUncertain ? "?confirm_uncertain=true" : "";
+    state.project = await api(
+      `/api/projects/${encodeURIComponent(projectId)}/shots/${encodeURIComponent(shotId)}/${kind}${confirmationQuery}`,
+      { method: "POST" },
+    );
     state.viewStage = "video";
     await refreshProjects();
-    showNotice(`${shotId} ${kind === "image" ? "关键帧" : "视频片段"}已生成。`, false);
+    const updatedShot = state.project.workflow?.video?.shots?.find((item) => item.shot_id === shotId);
+    const status = kind === "video" ? updatedShot?.video?.status : updatedShot?.image?.status;
+    if (kind === "video" && ["queued", "submitting", "generating"].includes(status)) {
+      showNotice(`${shotId} 视频任务已进入后台处理；任务状态会自动更新。`, false);
+    } else {
+      showNotice(`${shotId} ${kind === "image" ? "关键帧" : "视频片段"}已生成。`, false);
+    }
     renderProject();
   } catch (error) {
     showNotice(error.message, true);
     try {
-      state.project = await api(`/api/projects/${encodeURIComponent(state.project.id)}`);
+      state.project = await api(`/api/projects/${encodeURIComponent(projectId)}`);
       state.viewStage = "video";
       renderProject();
     } catch {

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import time
 from copy import deepcopy
+from datetime import datetime, timezone
 from dataclasses import replace
 from pathlib import Path
 
@@ -12,7 +14,12 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.main import create_app
 from app.providers.catalog import ModelCatalog, ModelProfile
-from app.providers.media import AgnesVideoProvider, AssetStore, OpenAICompatibleImageProvider
+from app.providers.media import (
+    AgnesVideoProvider,
+    AssetStore,
+    OpenAICompatibleImageProvider,
+    VideoSubmissionUncertainError,
+)
 from app.providers.text import ChatResult, OpenAICompatibleTextProvider
 from app.services.chat import ChatService
 
@@ -106,7 +113,7 @@ def test_home_page_avoids_stale_markup_and_loads_versioned_assets(tmp_path):
     assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate"
     assert 'id="open-records"' in response.text
     assert 'id="confirm-dialog"' in response.text
-    assert "/static/app.js?v=10" in response.text
+    assert "/static/app.js?v=11" in response.text
     assert "/static/style.css?v=10" in response.text
 
 
@@ -658,6 +665,249 @@ def test_agnes_image_provider_posts_generation_and_returns_url(tmp_path):
     assert captured["body"]["model"] == "agnes-image-2.5-flash"
     assert captured["body"]["ratio"] == "9:16"
     assert captured["body"]["extra_body"]["response_format"] == "url"
+
+
+def test_agnes_video_queue_full_is_actionable_and_does_not_poll(tmp_path):
+    requests = []
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        return httpx.Response(503, json={
+            "code": "video_queue_full",
+            "message": "video queue is full, please retry later (request id: req-test-123)",
+            "data": None,
+        })
+
+    profile = ModelCatalog.load(CATALOG_PATH).resolve("agnes-video", "video")
+    provider = AgnesVideoProvider(
+        profile,
+        "test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    client = TestClient(
+        create_app(settings=make_settings(tmp_path), video_provider=provider),
+        client=("127.0.0.1", 54321),
+    )
+    project = new_project(client).json()
+    for stage in ("script", "prompt", "storyboard", "scenes"):
+        assert client.post(f"/api/projects/{project['id']}/generate/{stage}", json={}).status_code == 200
+        assert client.post(f"/api/projects/{project['id']}/approve/{stage}").status_code == 200
+
+    response = client.post(f"/api/projects/{project['id']}/shots/S01/video")
+    assert response.status_code == 202
+    assert response.json()["workflow"]["video"]["shots"][0]["video"]["status"] == "queued"
+    assert requests == []
+
+    worker = client.app.state.video_job_worker
+    assert worker.process_once() is True
+    shot = client.get(f"/api/projects/{project['id']}").json()["workflow"]["video"]["shots"][0]
+    assert shot["video"]["status"] == "failed"
+    assert "Agnes 视频生成队列已满" in shot["video"]["error"]
+    assert "请稍后手动重试" in shot["video"]["error"]
+    assert "req-test-123" in shot["video"]["error"]
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+
+
+def test_durable_video_jobs_resume_polling_and_guard_uncertain_submission(tmp_path):
+    class AsyncVideoProvider:
+        ready = True
+
+        def __init__(self, poll_result=None, submit_error=None):
+            self.poll_result = poll_result
+            self.submit_error = submit_error
+            self.submissions = 0
+            self.polls = []
+
+        def submit_video(self, *, project):
+            self.submissions += 1
+            if self.submit_error:
+                raise self.submit_error
+            return {"provider_task_id": f"provider-video-{self.submissions}", "task_id": f"task-{self.submissions}"}
+
+        def poll_video(self, *, provider_task_id):
+            self.polls.append(provider_task_id)
+            return self.poll_result or {"status": "queued", "provider_status": "queued"}
+
+        def generate_video(self, *, project):
+            raise AssertionError("durable providers must use submit_video/poll_video")
+
+    first_provider = AsyncVideoProvider()
+    first_client = TestClient(
+        create_app(settings=make_settings(tmp_path), video_provider=first_provider),
+        client=("127.0.0.1", 54321),
+    )
+    project = new_project(first_client).json()
+    for stage in ("script", "prompt", "storyboard", "scenes"):
+        assert first_client.post(f"/api/projects/{project['id']}/generate/{stage}", json={}).status_code == 200
+        assert first_client.post(f"/api/projects/{project['id']}/approve/{stage}").status_code == 200
+
+    queued = first_client.post(f"/api/projects/{project['id']}/shots/S01/video")
+    assert queued.status_code == 202
+    job_id = queued.json()["workflow"]["video"]["shots"][0]["video"]["job_id"]
+    assert first_provider.submissions == 0
+    assert first_client.app.state.video_job_worker.process_once() is True
+    job = first_client.app.state.workflow.store.get_video_job(job_id)
+    assert job["status"] == "polling"
+    assert job["provider_task_id"] == "provider-video-1"
+    assert job["task_id"] == "task-1"
+
+    resumed_provider = AsyncVideoProvider({
+        "status": "completed",
+        "provider_status": "completed",
+        "asset_url": "https://media.example/resumed.mp4",
+    })
+    resumed_client = TestClient(
+        create_app(settings=make_settings(tmp_path), video_provider=resumed_provider),
+        client=("127.0.0.1", 54321),
+    )
+    resumed_store = resumed_client.app.state.workflow.store
+    resumed_store.update_video_job(
+        job_id,
+        {"next_poll_at": datetime.now(timezone.utc).isoformat()},
+    )
+    with resumed_client:
+        deadline = time.monotonic() + 5
+        resumed_project = resumed_client.get(f"/api/projects/{project['id']}").json()
+        while time.monotonic() < deadline:
+            video_asset = resumed_project["workflow"]["video"]["shots"][0]["video"]
+            if video_asset["status"] == "ready":
+                break
+            time.sleep(0.05)
+            resumed_project = resumed_client.get(f"/api/projects/{project['id']}").json()
+        video_asset = resumed_project["workflow"]["video"]["shots"][0]["video"]
+        assert video_asset["status"] == "ready"
+        assert video_asset["asset_url"] == "https://media.example/resumed.mp4"
+    assert resumed_provider.polls == ["provider-video-1"]
+    assert resumed_store.get_video_job(job_id)["status"] == "completed"
+
+    stale_queued = first_client.post(f"/api/projects/{project['id']}/shots/S03/video")
+    assert stale_queued.status_code == 202
+    stale_store = first_client.app.state.workflow.store
+    stale_job_id = stale_queued.json()["workflow"]["video"]["shots"][2]["video"]["job_id"]
+    assert first_client.app.state.video_job_worker.process_once() is True
+    changed_project = stale_store.get(project["id"])
+    changed_project["workflow"]["video"]["shots"][2]["video_prompt"] += " Camera moves left."
+    stale_store.save(changed_project)
+    stale_store.update_video_job(
+        stale_job_id,
+        {"next_poll_at": datetime.now(timezone.utc).isoformat()},
+    )
+    stale_provider = AsyncVideoProvider({
+        "status": "completed",
+        "provider_status": "completed",
+        "asset_url": "https://media.example/stale.mp4",
+    })
+    stale_client = TestClient(
+        create_app(settings=make_settings(tmp_path), video_provider=stale_provider),
+        client=("127.0.0.1", 54321),
+    )
+    with stale_client:
+        deadline = time.monotonic() + 5
+        stale_project = stale_client.get(f"/api/projects/{project['id']}").json()
+        while time.monotonic() < deadline:
+            stale_asset = stale_project["workflow"]["video"]["shots"][2]["video"]
+            if stale_asset["status"] == "stale":
+                break
+            time.sleep(0.05)
+            stale_project = stale_client.get(f"/api/projects/{project['id']}").json()
+        stale_asset = stale_project["workflow"]["video"]["shots"][2]["video"]
+        assert stale_asset["status"] == "stale"
+        assert stale_asset["asset_url"] == "https://media.example/stale.mp4"
+        assert stale_asset["versions"][-1]["stale"] is True
+    assert stale_store.get_video_job(stale_job_id)["status"] == "completed"
+
+    uncertain_provider = AsyncVideoProvider(submit_error=VideoSubmissionUncertainError("响应丢失"))
+    uncertain_client = TestClient(
+        create_app(settings=make_settings(tmp_path), video_provider=uncertain_provider),
+        client=("127.0.0.1", 54321),
+    )
+    uncertain = uncertain_client.post(f"/api/projects/{project['id']}/shots/S02/video")
+    assert uncertain.status_code == 202
+    uncertain_worker = uncertain_client.app.state.video_job_worker
+    assert uncertain_worker.process_once() is True
+    interrupted_project = uncertain_client.get(f"/api/projects/{project['id']}").json()
+    interrupted_asset = interrupted_project["workflow"]["video"]["shots"][1]["video"]
+    assert interrupted_asset["status"] == "interrupted"
+    assert "响应丢失" in interrupted_asset["error"]
+    assert uncertain_client.post(f"/api/projects/{project['id']}/shots/S02/video").status_code == 409
+    retried = uncertain_client.post(
+        f"/api/projects/{project['id']}/shots/S02/video?confirm_uncertain=true"
+    )
+    assert retried.status_code == 202
+    assert uncertain_provider.submissions == 1
+
+
+def test_submitting_video_job_is_recovered_as_uncertain_after_restart(tmp_path):
+    class AsyncVideoProvider:
+        ready = True
+
+        def __init__(self):
+            self.submissions = 0
+
+        def submit_video(self, *, project):
+            self.submissions += 1
+            return {"provider_task_id": "must-not-submit-again", "task_id": "must-not-submit-again"}
+
+        def poll_video(self, *, provider_task_id):
+            raise AssertionError("an interrupted submission has no safe provider task ID to poll")
+
+    first_provider = AsyncVideoProvider()
+    first_client = TestClient(
+        create_app(settings=make_settings(tmp_path), video_provider=first_provider),
+        client=("127.0.0.1", 54321),
+    )
+    project = new_project(first_client).json()
+    for stage in ("script", "prompt", "storyboard", "scenes"):
+        first_client.post(f"/api/projects/{project['id']}/generate/{stage}", json={})
+        first_client.post(f"/api/projects/{project['id']}/approve/{stage}")
+    queued = first_client.post(f"/api/projects/{project['id']}/shots/S01/video")
+    assert queued.status_code == 202
+    job_id = queued.json()["workflow"]["video"]["shots"][0]["video"]["job_id"]
+    claimed = first_client.app.state.workflow.store.claim_next_video_job()
+    assert claimed["id"] == job_id
+    assert claimed["status"] == "submitting"
+
+    resumed_provider = AsyncVideoProvider()
+    resumed_client = TestClient(
+        create_app(settings=make_settings(tmp_path), video_provider=resumed_provider),
+        client=("127.0.0.1", 54321),
+    )
+    with resumed_client:
+        recovered_project = resumed_client.get(f"/api/projects/{project['id']}").json()
+        recovered_asset = recovered_project["workflow"]["video"]["shots"][0]["video"]
+        assert recovered_asset["status"] == "interrupted"
+        assert "服务在提交视频任务期间停止" in recovered_asset["error"]
+        assert resumed_client.app.state.workflow.store.get_video_job(job_id)["status"] == "interrupted"
+    assert first_provider.submissions == 0
+    assert resumed_provider.submissions == 0
+
+
+def test_agnes_video_provider_marks_server_error_submission_uncertain():
+    profile = ModelCatalog.load(CATALOG_PATH).resolve("agnes-video", "video")
+    provider = AgnesVideoProvider(
+        profile,
+        "test-key",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    502,
+                    json={"code": "gateway_error", "message": "upstream unavailable"},
+                    headers={"x-request-id": "req-uncertain-502"},
+                )
+            )
+        ),
+    )
+
+    with pytest.raises(VideoSubmissionUncertainError) as error:
+        provider.submit_video(project={
+            "brief": {"duration_seconds": 6},
+            "video_prompt": "A cinematic coffee ad",
+            "aspect_ratio": "9:16",
+        })
+
+    assert "req-uncertain-502" in str(error.value)
+    assert "供应商是否已受理未知" in str(error.value)
 
 
 def test_agnes_video_provider_creates_and_polls_async_task():

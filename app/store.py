@@ -3,8 +3,13 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+
+class VideoJobConflict(RuntimeError):
+    pass
 
 
 class ProjectStore:
@@ -49,23 +54,167 @@ class ProjectStore:
                     payload TEXT NOT NULL
                 )"""
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS video_jobs (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    shot_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    next_poll_at TEXT,
+                    payload TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_video_jobs_status_poll "
+                "ON video_jobs(status, next_poll_at, created_at)"
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_video_jobs_active_shot
+                   ON video_jobs(project_id, shot_id)
+                   WHERE status IN ('queued', 'submitting', 'polling')"""
+            )
+
+    @staticmethod
+    def _save_project_record(connection: sqlite3.Connection, project: dict[str, Any]) -> None:
+        connection.execute(
+            """INSERT INTO projects (id, created_at, updated_at, payload)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 updated_at = excluded.updated_at,
+                 payload = excluded.payload""",
+            (
+                project["id"],
+                project["created_at"],
+                project["updated_at"],
+                json.dumps(project, ensure_ascii=False),
+            ),
+        )
 
     def save(self, project: dict[str, Any]) -> dict[str, Any]:
         with self._connection() as connection:
+            self._save_project_record(connection, project)
+        return project
+
+    def enqueue_video_job(self, project: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """SELECT id FROM video_jobs
+                   WHERE project_id = ? AND shot_id = ?
+                     AND status IN ('queued', 'submitting', 'polling')
+                   LIMIT 1""",
+                (job["project_id"], job["shot_id"]),
+            ).fetchone()
+            if active:
+                raise VideoJobConflict("这个镜头已有正在处理的视频任务。")
+            self._save_project_record(connection, project)
+            try:
+                connection.execute(
+                    """INSERT INTO video_jobs
+                       (id, project_id, shot_id, status, created_at, updated_at, next_poll_at, payload)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        job["id"], job["project_id"], job["shot_id"], job["status"],
+                        job["created_at"], job["updated_at"], job.get("next_poll_at"),
+                        json.dumps(job, ensure_ascii=False),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise VideoJobConflict("这个镜头已有正在处理的视频任务。") from exc
+        return job
+
+    def get_video_job(self, job_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM video_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def latest_video_job(self, project_id: str, shot_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT payload FROM video_jobs
+                   WHERE project_id = ? AND shot_id = ?
+                   ORDER BY created_at DESC LIMIT 1""",
+                (project_id, shot_id),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def list_video_jobs(self, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            if statuses:
+                placeholders = ", ".join("?" for _ in statuses)
+                rows = connection.execute(
+                    f"SELECT payload FROM video_jobs WHERE status IN ({placeholders}) ORDER BY created_at",
+                    tuple(sorted(statuses)),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT payload FROM video_jobs ORDER BY created_at"
+                ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def claim_next_video_job(self) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload FROM video_jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            job = json.loads(row["payload"])
+            job.update({
+                "status": "submitting",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "next_poll_at": None,
+            })
             connection.execute(
-                """INSERT INTO projects (id, created_at, updated_at, payload)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                     updated_at = excluded.updated_at,
-                     payload = excluded.payload""",
+                """UPDATE video_jobs SET status = ?, updated_at = ?, next_poll_at = NULL, payload = ?
+                   WHERE id = ? AND status = 'queued'""",
+                (job["status"], job["updated_at"], json.dumps(job, ensure_ascii=False), job["id"]),
+            )
+        return job
+
+    def next_polling_video_job(self, now: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT payload FROM video_jobs
+                   WHERE status = 'polling' AND (next_poll_at IS NULL OR next_poll_at <= ?)
+                   ORDER BY COALESCE(next_poll_at, created_at), created_at LIMIT 1""",
+                (now,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def update_video_job(
+        self,
+        job_id: str,
+        updates: dict[str, Any],
+        *,
+        project: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM video_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"找不到视频任务 {job_id}。")
+            job = json.loads(row["payload"])
+            job.update(updates)
+            job["updated_at"] = datetime.now(timezone.utc).isoformat()
+            connection.execute(
+                """UPDATE video_jobs
+                   SET status = ?, updated_at = ?, next_poll_at = ?, payload = ?
+                   WHERE id = ?""",
                 (
-                    project["id"],
-                    project["created_at"],
-                    project["updated_at"],
-                    json.dumps(project, ensure_ascii=False),
+                    job["status"], job["updated_at"], job.get("next_poll_at"),
+                    json.dumps(job, ensure_ascii=False), job_id,
                 ),
             )
-        return project
+            if project is not None:
+                self._save_project_record(connection, project)
+        return job
 
     def get(self, project_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
