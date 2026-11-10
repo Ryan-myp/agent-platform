@@ -14,6 +14,8 @@ class ProjectCreate(BaseModel):
     style: str = Field(default="真实、清晰、有记忆点", max_length=300)
     duration_seconds: int = Field(default=30, ge=6, le=180)
     model: str | None = None
+    series_id: str | None = Field(default=None, max_length=64)
+    episode_number: int | None = Field(default=None, ge=1, le=9999)
 
 
 class ChatSessionCreate(BaseModel):
@@ -62,6 +64,68 @@ class ChatRequest(BaseModel):
     message: str = Field(default="", max_length=10000)
     model: str | None = None
     attachment_ids: list[str] = Field(default_factory=list, max_length=8)
+
+
+class SeriesCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    logline: str = Field(default="", max_length=3000)
+    genre: str = Field(default="", max_length=300)
+    world_setting: str = Field(default="", max_length=5000)
+    central_theme: str = Field(default="", max_length=2000)
+    season_arc: str = Field(default="", max_length=5000)
+    character_arcs: str = Field(default="", max_length=5000)
+    ending: str = Field(default="", max_length=3000)
+    tone: str = Field(default="", max_length=1000)
+    content_boundaries: str = Field(default="", max_length=2000)
+    visual_style: str = Field(default="", max_length=2000)
+    notes: str = Field(default="", max_length=5000)
+
+
+class SeriesUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    logline: str | None = Field(default=None, max_length=3000)
+    genre: str | None = Field(default=None, max_length=300)
+    world_setting: str | None = Field(default=None, max_length=5000)
+    central_theme: str | None = Field(default=None, max_length=2000)
+    season_arc: str | None = Field(default=None, max_length=5000)
+    character_arcs: str | None = Field(default=None, max_length=5000)
+    ending: str | None = Field(default=None, max_length=3000)
+    tone: str | None = Field(default=None, max_length=1000)
+    content_boundaries: str | None = Field(default=None, max_length=2000)
+    visual_style: str | None = Field(default=None, max_length=2000)
+    notes: str | None = Field(default=None, max_length=5000)
+    archived: bool | None = None
+
+
+class SeriesContinuityCreate(BaseModel):
+    kind: Literal["fact", "event", "relationship", "clue", "open_thread", "constraint"]
+    summary: str = Field(min_length=1, max_length=1200)
+    status: Literal["confirmed", "open", "resolved", "archived"] = "confirmed"
+    source_project_id: str | None = Field(default=None, max_length=64)
+    source_stage: Literal["script", "prompt", "storyboard", "scenes"] | None = None
+    source_excerpt: str | None = Field(default=None, max_length=1000)
+
+
+class SeriesContinuityUpdate(BaseModel):
+    summary: str | None = Field(default=None, min_length=1, max_length=1200)
+    status: Literal["confirmed", "open", "resolved", "archived"] | None = None
+
+
+class SeriesAssetCreate(BaseModel):
+    kind: Literal["character", "location", "prop"]
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=3000)
+    visual_prompt: str = Field(default="", max_length=3000)
+    continuity_notes: str = Field(default="", max_length=3000)
+
+
+class SeriesAssetUpdate(BaseModel):
+    kind: Literal["character", "location", "prop"] | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=3000)
+    visual_prompt: str | None = Field(default=None, max_length=3000)
+    continuity_notes: str | None = Field(default=None, max_length=3000)
+    archived: bool | None = None
 
 
 class StorageCleanupRequest(BaseModel):

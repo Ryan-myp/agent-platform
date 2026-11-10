@@ -29,6 +29,10 @@ class VideoJobWorker:
         self._thread: threading.Thread | None = None
         self._start_lock = threading.Lock()
 
+    @property
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive() and not self._stop.is_set())
+
     def start(self) -> None:
         with self._start_lock:
             if self._thread and self._thread.is_alive():

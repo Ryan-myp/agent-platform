@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#f5f8f7" />
     <meta name="description" content="通过对话生成并逐步确认脚本、图片、视频和音频内容。" />
     <title>片场 · AI 内容创作台</title>
-    <link rel="stylesheet" href="/static/style.css?v=16" />
-    <script src="/static/app.js?v=16" defer></script>
+    <link rel="stylesheet" href="/static/style.css?v=22" />
+    <script src="/static/app.js?v=23" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -20,6 +20,7 @@
           <button class="sidebar-action new-project" id="new-project" type="button"><span aria-hidden="true">＋</span> 新对话</button>
           <button class="sidebar-action new-workflow" id="new-workflow" type="button"><span aria-hidden="true">▧</span> 创作流程</button>
           <button class="sidebar-action records-action" id="open-records" type="button"><span aria-hidden="true">▤</span> 制作记录</button>
+          <button class="sidebar-action series-action" id="open-series" type="button"><span aria-hidden="true">⌘</span> 剧集资产</button>
           <button class="sidebar-action" id="open-usage" type="button"><span aria-hidden="true">◷</span> 用量与存储</button>
         </div>
         <div class="side-heading">最近对话</div>
@@ -42,6 +43,7 @@
             <button class="button button-subtle topbar-button" id="view-toggle" type="button" disabled hidden>查看工作流</button>
           </div>
         </header>
+        <div id="compatibility-status" class="compatibility-banner" role="status" aria-live="polite" hidden></div>
         <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
         <section id="workspace" class="workspace" aria-live="polite"></section>
       </main>
@@ -73,6 +75,16 @@
         <section class="usage-section" aria-labelledby="usage-summary-title">
           <h3 id="usage-summary-title">调用统计</h3>
           <div id="usage-summary" class="usage-summary" aria-live="polite">正在读取本地用量…</div>
+        </section>
+        <section class="usage-section" aria-labelledby="video-jobs-title">
+          <div class="storage-cleanup-heading"><h3 id="video-jobs-title">视频任务</h3><button class="button button-subtle" id="refresh-video-jobs" type="button">刷新任务</button></div>
+          <div id="video-jobs-summary" class="video-jobs-summary" aria-live="polite">正在读取本地任务…</div>
+        </section>
+        <section class="usage-section" aria-labelledby="backup-export-title">
+          <h3 id="backup-export-title">备份与恢复</h3>
+          <p>下载当前数据库快照和本地媒体（不含模型凭据）。在线导出时两者不是同一事务；要求同一时间点时，请先停止服务并使用 CLI。</p>
+          <a class="button button-subtle" id="export-backup" href="/api/backup/export">下载完整备份</a>
+          <p id="backup-export-status" class="backup-export-status" role="status" aria-live="polite"></p>
         </section>
         <section class="usage-section storage-cleanup" aria-labelledby="storage-cleanup-title">
           <div class="storage-cleanup-heading">

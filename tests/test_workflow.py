@@ -114,10 +114,10 @@ def test_home_page_avoids_stale_markup_and_loads_versioned_assets(tmp_path):
     assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate"
     assert 'id="open-records"' in response.text
     assert 'id="confirm-dialog"' in response.text
-    assert "/static/app.js?v=16" in response.text
-    assert "/static/style.css?v=16" in response.text
+    assert "/static/app.js?v=23" in response.text
+    assert "/static/style.css?v=22" in response.text
 
-    stylesheet = client.get("/static/style.css?v=16")
+    stylesheet = client.get("/static/style.css?v=22")
     assert stylesheet.status_code == 200
     assert "fonts.googleapis.com" not in stylesheet.text
 

@@ -1,10 +1,13 @@
 let videoJobPollTimer = null;
 let videoJobPollInFlight = false;
 let storageCleanupPreview = null;
+const EXPECTED_API_CONTRACT_VERSION = 3;
 
 const state = {
   config: null,
   projects: [],
+  series: [],
+  selectedSeriesId: null,
   project: null,
   viewStage: null,
   selectedModel: null,
@@ -221,6 +224,27 @@ async function api(path, options = {}) {
   return payload;
 }
 
+function showCompatibilityStatus(status) {
+  const banner = document.querySelector("#compatibility-status");
+  if (!banner) return;
+  const required = ["series", "series_transfer", "story_continuity_ledger", "quality_checks", "video_jobs", "content_revisions", "production_delivery"];
+  const missing = required.filter((feature) => !status?.features?.includes(feature));
+  const messages = [];
+  if (!status) messages.push("无法读取本地服务版本信息。");
+  else if (status.api_contract_version !== EXPECTED_API_CONTRACT_VERSION || missing.length) {
+    messages.push(`前后端接口版本不兼容（服务端 ${status.api_contract_version ?? "未知"}，页面需要 ${EXPECTED_API_CONTRACT_VERSION}）。`);
+  }
+  if (missing.length) messages.push(`缺少功能：${missing.join("、")}。`);
+  if (status && status.video_job_worker_running === false) messages.push("视频任务后台工作线程未运行，排队任务可能无法推进。");
+  if (!messages.length) {
+    banner.hidden = true;
+    banner.textContent = "";
+    return;
+  }
+  banner.hidden = false;
+  banner.textContent = `${messages.join(" ")} 请重启本地服务并硬刷新页面（⌘⇧R）；本地单用户模式不会因此开放公网访问。`;
+}
+
 function showNotice(message, isError = false) {
   notice.hidden = !message;
   notice.textContent = message || "";
@@ -420,6 +444,12 @@ const TRACK_SETUP_COPY = {
 
 function updateWorkflowTrackCopy(track) {
   const copy = TRACK_SETUP_COPY[track] || TRACK_SETUP_COPY.marketing;
+  const seriesAssociation = document.querySelector("#series-association");
+  if (seriesAssociation) {
+    const dramaEnabled = track === "drama";
+    seriesAssociation.hidden = !dramaEnabled;
+    seriesAssociation.querySelectorAll("select, input").forEach((field) => { field.disabled = !dramaEnabled; });
+  }
   for (const field of ["business", "product", "audience", "platform", "duration", "style"]) {
     const label = document.querySelector(`[data-track-label="${field}"]`);
     if (label) label.textContent = copy[field];
@@ -454,6 +484,10 @@ function renderWorkflowSetup() {
   viewToggle.hidden = true;
   viewToggle.disabled = true;
   syncModelControl();
+  const availableSeries = (state.series || []).filter((series) => !series.archived);
+  const selectedSeriesId = availableSeries.some((series) => series.id === state.selectedSeriesId)
+    ? state.selectedSeriesId
+    : "";
   workspace.innerHTML = `
     <section class="welcome-panel">
       <div class="welcome-copy">
@@ -478,6 +512,17 @@ function renderWorkflowSetup() {
           <label><span data-track-label="duration">视频时长（秒）</span><input name="duration_seconds" type="number" min="6" max="180" value="30" required /></label>
           <label><span data-track-label="style">整体风格</span><input name="style" value="真实、清晰、有记忆点" maxlength="300" /></label>
         </div>
+        <section id="series-association" class="series-association" aria-labelledby="series-association-title" hidden>
+          <h2 id="series-association-title">加入故事系列</h2>
+          <div class="form-row">
+            <label for="series-select">所属系列<select id="series-select" name="series_id" aria-describedby="series-association-help">
+              <option value="">独立分集，不关联系列</option>
+              ${availableSeries.map((series) => `<option value="${escapeHTML(series.id)}" ${series.id === selectedSeriesId ? "selected" : ""}>${escapeHTML(series.title)}</option>`).join("")}
+            </select></label>
+            <label for="episode-number">集数（可选）<input id="episode-number" name="episode_number" type="number" min="1" max="9999" placeholder="自动分配" aria-describedby="series-association-help" /></label>
+          </div>
+          <p id="series-association-help" class="form-note">选择系列后，该系列的梗概、视觉基调和有效资产会作为后续生成参考。集数留空时自动使用下一个可用编号。</p>
+        </section>
         <div class="form-footer">
           <span class="form-note" id="track-form-note" aria-live="polite">创建后进入品牌营销工作台；每一步可先审阅和确认，媒体生成只会在你明确触发时调用已配置的服务。</span>
           <button class="button button-primary" type="submit">创建创作流程 <span aria-hidden="true">↗</span></button>
@@ -501,6 +546,9 @@ function renderWorkflowSetup() {
     input.addEventListener("input", () => { input.dataset.userEdited = "true"; });
   }
   trackSelect.addEventListener("change", () => updateWorkflowTrackCopy(trackSelect.value));
+  createForm.querySelector("#series-select").addEventListener("change", (event) => {
+    state.selectedSeriesId = event.currentTarget.value || null;
+  });
   updateWorkflowTrackCopy(trackSelect.value);
   createForm.addEventListener("submit", createProject);
 }
@@ -639,7 +687,8 @@ function renderRevisionHistory(item) {
   if (!revisions.length) return "";
   return `<details class="stage-revision-history"><summary>历史草稿（${revisions.length}）</summary><ol>${revisions.map((revision, index) => `
     <li><span>${escapeHTML(recordDate(revision.archived_at))} · ${escapeHTML(revision.reason || "旧版")}</span>
-      <button class="button button-subtle" type="button" data-revision-index="${index}">载入此版本</button></li>`).join("")}</ol></details>`;
+      <div class="stage-footer-actions"><button class="button button-subtle" type="button" data-revision-index="${index}">载入编辑区</button>
+        <button class="button button-subtle" type="button" data-revision-restore="${escapeHTML(revision.revision_id || "")}">恢复为当前版本</button></div></li>`).join("")}</ol></details>`;
 }
 
 function renderProject() {
@@ -651,6 +700,7 @@ function renderProject() {
   const viewStage = state.viewStage || project.active_stage;
   const viewIndex = state.config.stages.findIndex((stage) => stage.id === viewStage);
   const item = project.workflow[viewStage];
+  const linkedSeries = (state.series || []).find((series) => series.id === project.series_id);
   const isCurrent = viewStage === project.active_stage;
   const stage = state.config.stages[viewIndex];
   document.querySelector("#top-title").textContent = project.title;
@@ -726,7 +776,9 @@ function renderProject() {
   workspace.innerHTML = `
     <div class="project-heading">
       <div><p class="section-kicker">${escapeHTML(project.track === "drama" ? "短剧 / 漫剧" : "品牌营销视频")} · ${escapeHTML(project.brief.platform)} · ${escapeHTML(project.brief.duration_seconds)} 秒</p>
-        <h1>${escapeHTML(project.title)}</h1><p class="project-description">${escapeHTML(project.brief.business)} · 面向 ${escapeHTML(project.brief.audience)}</p></div>
+        <h1>${escapeHTML(project.title)}</h1>
+        ${project.series_id ? `<p class="project-series-note">EP${String(project.episode_number || 0).padStart(2, "0")} · ${escapeHTML(linkedSeries?.title || "所属故事系列")}</p>` : ""}
+        <p class="project-description">${escapeHTML(project.brief.business)} · 面向 ${escapeHTML(project.brief.audience)}</p></div>
       <div class="project-state"><span class="state-dot" aria-hidden="true"></span>当前步骤：${escapeHTML(stageLabel(project.active_stage))}</div>
     </div>
     <nav class="stage-rail" aria-label="创作步骤">${stepButtons}</nav>
@@ -735,6 +787,7 @@ function renderProject() {
         <h2 id="stage-title">${escapeHTML(stage.label)}</h2><p>${escapeHTML(stage.purpose)}</p></div><span class="stage-time">${escapeHTML(project.brief.duration_seconds)} 秒${project.track === "drama" ? "单集目标" : "目标"}时长</span></div>
       ${viewStage === "script" ? `<div class="brief-strip"><strong>${project.track === "drama" ? "作品 / 项目名" : "产品 / 服务"}</strong><span>${escapeHTML(project.brief.product)}</span><strong>${project.track === "drama" ? "媒介 / 风格" : "风格"}</strong><span>${escapeHTML(project.brief.style)}</span></div>` : ""}
       <div class="stage-content">${contentArea}</div>
+      ${editorContent && !isVideo ? '<div class="quality-check-bar"><button class="button button-subtle" id="run-quality-check" type="button">运行质量检查</button><div id="quality-results" class="quality-results" role="status" aria-live="polite"></div></div>' : ""}
       <div class="stage-footer"><span class="footer-hint">${isVideo ? "媒体生成按镜头单独触发；费用以供应商实际返回为准，当前不在本地拼接视频。" : "已确认步骤可回退修改；后续内容会保留并标记为过期，重新审阅后再继续。"}</span>${action}</div>
     </section>
     <p class="workspace-footnote">文本模型：${escapeHTML(modelName(project.model))} <span aria-hidden="true">·</span> 本地技能：${state.skillCount ?? 0} 个</p>`;
@@ -764,6 +817,10 @@ function renderProject() {
       showNotice("旧版草稿已载入编辑区；保存后才会替换当前内容。", false);
     });
   });
+  workspace.querySelectorAll("[data-revision-restore]").forEach((button) => {
+    button.addEventListener("click", () => restoreStageRevision(viewStage, button.dataset.revisionRestore));
+  });
+  workspace.querySelector("#run-quality-check")?.addEventListener("click", runStageQualityCheck);
   workspace.querySelector("#preview-stage-view")?.addEventListener("click", (event) => {
     stagePreview.innerHTML = viewStage === "scenes" ? renderScenePlanPreview(stageEditor.value) : renderMarkdown(stageEditor.value);
     stageEditor.hidden = true;
@@ -897,6 +954,43 @@ function filterProductionRecords() {
   if (empty) empty.hidden = visibleCount > 0;
 }
 
+async function importProjectBundleFromFile(input) {
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  if (file.size > 512 * 1024 * 1024) {
+    showNotice("项目导入包超过 512 MiB 限制。", true);
+    return;
+  }
+  const confirmed = await confirmInApp({
+    title: "导入为新的项目副本？",
+    message: "现有项目不会被覆盖。导入会复制项目记录、聊天附件和本地媒体；在途供应商任务不会恢复，系列会作为只含当前分集的副本导入。导出包可能包含敏感创作内容，请仅导入可信文件。",
+    confirmLabel: "导入副本",
+    cancelLabel: "取消",
+  });
+  if (!confirmed) return;
+
+  const button = document.querySelector("#import-project");
+  if (button) button.disabled = true;
+  showNotice("正在校验并导入项目副本…");
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+    const response = await fetch("/api/projects/import", { method: "POST", body: formData });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.detail || `导入失败（${response.status}）`);
+    await Promise.all([refreshProjects(), refreshSeries()]);
+    if (result.project.mode === "workflow") await openProductionRecord(result.project.id);
+    else await openProject(result.project.id);
+    const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+    showNotice(`已导入新的项目副本。${warnings.length ? ` ${warnings.join(" ")}` : ""}`);
+  } catch (error) {
+    showNotice(error.message, true);
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
+}
+
 function renderProductionRecords() {
   state.viewMode = "records";
   workspace.classList.remove("chat-workspace");
@@ -935,7 +1029,9 @@ function renderProductionRecords() {
   workspace.innerHTML = `<section class="records-screen" aria-labelledby="records-title">
     <header class="records-heading"><div><p class="section-kicker">作品库</p><h1 id="records-title">制作记录</h1>
       <p>每次创作都会保留脚本、逐镜任务、视频片段和 AI 剪辑方案，随时回看或继续制作。</p></div>
-      <button class="button button-primary" id="records-new-workflow" type="button">新建创作流程 <span aria-hidden="true">↗</span></button>
+      <div class="record-heading-actions"><button class="button button-subtle" id="import-project" type="button">导入项目副本</button>
+        <input id="project-import-file" type="file" accept=".zip,application/zip" hidden />
+        <button class="button button-primary" id="records-new-workflow" type="button">新建创作流程 <span aria-hidden="true">↗</span></button></div>
     </header>
     ${records.length ? `<div class="record-toolbar">
       <label class="record-search" for="record-search"><span class="sr-only">搜索制作记录</span><span aria-hidden="true">⌕</span><input id="record-search" type="search" placeholder="搜索项目名称、故事设定或业务" /></label>
@@ -951,13 +1047,15 @@ function renderProductionRecords() {
     <p id="record-filter-empty" class="record-filter-empty" hidden>没有符合条件的制作记录。</p>`
       : `<div class="records-empty"><span class="records-empty-mark" aria-hidden="true">▤</span><h2>还没有制作记录</h2>
         <p>创建创作流程后，确认过的脚本、分镜、逐镜片段和 AI 剪辑方案都会保存在这里。</p>
-        <button class="button button-primary" id="records-new-workflow" type="button">创建第一个项目 <span aria-hidden="true">↗</span></button></div>`}
+        <button class="button button-primary" id="record-empty-new-workflow" type="button">创建第一个项目 <span aria-hidden="true">↗</span></button></div>`}
   </section>`;
 
   workspace.querySelectorAll("[data-open-record]").forEach((button) => {
     button.addEventListener("click", () => openProductionRecord(button.dataset.openRecord));
   });
-  workspace.querySelector("#records-new-workflow")?.addEventListener("click", () => {
+  workspace.querySelector("#import-project")?.addEventListener("click", () => workspace.querySelector("#project-import-file")?.click());
+  workspace.querySelector("#project-import-file")?.addEventListener("change", (event) => importProjectBundleFromFile(event.currentTarget));
+  workspace.querySelector("#records-new-workflow, #record-empty-new-workflow")?.addEventListener("click", () => {
     state.project = null;
     state.viewStage = null;
     showNotice("");
@@ -1019,7 +1117,9 @@ function renderProductionRecordDetail(project) {
 
   workspace.innerHTML = `<section class="record-detail" aria-labelledby="record-detail-title">
     <div class="record-detail-nav"><button class="record-back-button" id="back-to-records" type="button"><span aria-hidden="true">←</span> 返回制作记录</button>
-      <button class="button button-subtle" id="continue-production" type="button">打开创作流程</button></div>
+      <div class="record-detail-actions"><a class="button button-subtle" href="/api/projects/${encodeURIComponent(project.id)}/export">导出项目副本</a>
+        <a class="button button-primary" href="/api/projects/${encodeURIComponent(project.id)}/delivery">下载制作交付包</a>
+        <button class="button button-subtle" id="continue-production" type="button">打开创作流程</button></div></div>
     <header class="record-detail-heading"><div><p class="section-kicker">${escapeHTML(project.track === "drama" ? "短剧 / 漫剧" : "品牌营销视频")} · ${escapeHTML(brief.platform || "创作流程")} · ${escapeHTML(brief.duration_seconds || "—")} 秒 · 创建于 ${escapeHTML(recordDate(project.created_at))}</p>
       <h1 id="record-detail-title">${escapeHTML(project.title || "未命名制作")}</h1>
       <p>${escapeHTML(brief.business || "创作项目")}${brief.audience ? ` · 面向 ${escapeHTML(brief.audience)}` : ""}</p></div>
@@ -1071,6 +1171,373 @@ async function showProductionRecords() {
   showNotice("");
   renderProjects();
   renderProductionRecords();
+}
+
+function seriesAssetKindLabel(kind) {
+  return ({ character: "人物", location: "场景", prop: "道具" })[kind] || "资产";
+}
+
+async function refreshSeries() {
+  state.series = await api("/api/series");
+}
+
+async function showSeriesLibrary() {
+  clearPendingUploads();
+  state.project = null;
+  state.viewStage = null;
+  state.chatMessages = [];
+  state.chatHasMore = false;
+  state.chatHistoryCursor = null;
+  state.chatLoadingOlder = false;
+  showNotice("");
+  try {
+    await refreshSeries();
+    renderSeriesLibrary();
+    renderProjects();
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
+async function exportSeriesBundle(seriesId) {
+  showNotice("正在打包系列、分集、对话和引用的本地媒体…", false);
+  try {
+    const response = await fetch(`/api/series/${encodeURIComponent(seriesId)}/export`);
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || `系列导出失败（${response.status}）`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("content-disposition") || "";
+    const filename = /filename="?([^";]+)"?/i.exec(disposition)?.[1] || "agent-platform-series.zip";
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showNotice("系列副本已准备下载；请在浏览器下载列表确认文件。", false);
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
+async function importSeriesBundleFromFile(input) {
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  if (file.size > 512 * 1024 * 1024) {
+    showNotice("系列导入包超过 512 MiB 限制。", true);
+    return;
+  }
+  const confirmed = await confirmInApp({
+    title: "导入为新的系列副本？",
+    message: "现有系列不会被覆盖。导入会复制系列资产、分集、聊天附件和引用的本地媒体；在途供应商任务不会恢复。导入包可能包含敏感创作内容，请仅导入可信文件。",
+    confirmLabel: "导入系列副本",
+    cancelLabel: "取消",
+  });
+  if (!confirmed) return;
+  const button = document.querySelector("#import-series");
+  if (button) button.disabled = true;
+  showNotice("正在校验并导入系列副本…", false);
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+    const response = await fetch("/api/series/import", { method: "POST", body: formData });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.detail || `系列导入失败（${response.status}）`);
+    await Promise.all([refreshSeries(), refreshProjects()]);
+    await openSeriesDetail(result.series.id);
+    const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+    showNotice(`已导入新的系列副本。${warnings.length ? ` ${warnings.join(" ")}` : ""}`, false);
+  } catch (error) {
+    showNotice(error.message, true);
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
+}
+
+function renderSeriesLibrary() {
+  state.viewMode = "series-library";
+  workspace.classList.remove("chat-workspace");
+  document.querySelector("#top-title").textContent = "剧集与资产";
+  const viewToggle = document.querySelector("#view-toggle");
+  viewToggle.hidden = true;
+  viewToggle.disabled = true;
+  syncModelControl();
+  workspace.innerHTML = `
+    <section class="series-screen">
+      <header class="series-heading">
+        <div><p class="section-kicker">短剧 / 漫剧 · 连续性资料</p><h1>剧集与创作资产</h1><p>按系列整理分集、人物、场景和道具。归档只会停止新增，不会删除已有内容。</p></div>
+        <div class="series-heading-tools"><button class="button button-subtle" id="import-series" type="button">导入系列副本</button>
+          <input id="series-import-file" type="file" accept=".zip,application/zip" hidden aria-label="选择系列导入包" />
+          <button class="button button-primary" id="show-series-create" type="button">新建系列</button></div>
+      </header>
+      <form id="series-create-form" class="series-form series-create-form" hidden>
+        <h2>建立一个故事系列</h2>
+        <label>系列名称<input name="title" required maxlength="120" placeholder="例如：雾港来信" /></label>
+        <label>一句话梗概<textarea name="logline" maxlength="3000" rows="2" placeholder="故事的核心冲突或贯穿线索"></textarea></label>
+        <label>系列视觉基调<textarea name="visual_style" maxlength="2000" rows="2" placeholder="跨集保持一致的色彩、媒介与影像质感"></textarea></label>
+        <label>系列备注<textarea name="notes" maxlength="5000" rows="2" placeholder="节奏、世界规则或其他长期设定"></textarea></label>
+        <p id="series-create-status" class="series-form-status" role="status" aria-live="polite"></p>
+        <div class="series-form-actions"><button class="button button-subtle" id="cancel-series-create" type="button">取消</button><button class="button button-primary" type="submit">保存系列</button></div>
+      </form>
+      ${state.series.length ? `<div class="series-list">${state.series.map((series) => `
+        <article class="series-list-row ${series.archived ? "is-archived" : ""}">
+          <div class="series-list-copy"><div class="series-list-title"><h2>${escapeHTML(series.title)}</h2>${series.archived ? '<span class="series-archive-badge">已归档</span>' : ""}</div>
+            <p>${escapeHTML(series.logline || "尚未填写系列梗概。")}</p><small>${series.episode_count} 集 · ${series.asset_count} 项有效资产</small></div>
+          <button class="button button-subtle" type="button" data-open-series="${escapeHTML(series.id)}">管理系列</button>
+        </article>`).join("")}</div>` : `
+        <div class="series-empty"><span class="series-empty-mark" aria-hidden="true">▤</span><h2>还没有故事系列</h2><p>先建立系列，再添加跨集复用的人物、场景和道具设定。</p><button class="button button-subtle" id="series-empty-create" type="button">建立第一个系列</button></div>`}
+    </section>`;
+  const createForm = workspace.querySelector("#series-create-form");
+  workspace.querySelector("#import-series")?.addEventListener("click", () => workspace.querySelector("#series-import-file")?.click());
+  workspace.querySelector("#series-import-file")?.addEventListener("change", (event) => importSeriesBundleFromFile(event.currentTarget));
+  const openCreate = () => { createForm.hidden = false; createForm.querySelector('[name="title"]').focus(); };
+  workspace.querySelector("#show-series-create")?.addEventListener("click", openCreate);
+  workspace.querySelector("#series-empty-create")?.addEventListener("click", openCreate);
+  workspace.querySelector("#cancel-series-create")?.addEventListener("click", () => { createForm.hidden = true; });
+  createForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const status = workspace.querySelector("#series-create-status");
+    const submit = createForm.querySelector('[type="submit"]');
+    submit.disabled = true;
+    status.textContent = "正在保存系列…";
+    try {
+      const created = await api("/api/series", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) });
+      await refreshSeries();
+      await openSeriesDetail(created.id);
+      showNotice("系列已建立。", false);
+    } catch (error) {
+      status.textContent = error.message;
+      submit.disabled = false;
+    }
+  });
+  workspace.querySelectorAll("[data-open-series]").forEach((button) => {
+    button.addEventListener("click", () => openSeriesDetail(button.dataset.openSeries));
+  });
+}
+
+async function openSeriesDetail(seriesId) {
+  try {
+    const series = await api(`/api/series/${encodeURIComponent(seriesId)}`);
+    renderSeriesDetail(series);
+    renderProjects();
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
+function renderSeriesAssetForm(asset = null) {
+  const prefix = asset ? `asset-${asset.id}` : "new-series-asset";
+  const value = (field) => escapeHTML(asset?.[field] || "");
+  const kind = asset?.kind || "character";
+  return `<form class="series-form series-asset-form" ${asset ? `data-series-asset-form="${escapeHTML(asset.id)}"` : 'id="new-series-asset-form"'}>
+    <div class="form-row"><label for="${prefix}-kind">资产类型<select id="${prefix}-kind" name="kind"><option value="character" ${kind === "character" ? "selected" : ""}>人物</option><option value="location" ${kind === "location" ? "selected" : ""}>场景</option><option value="prop" ${kind === "prop" ? "selected" : ""}>道具</option></select></label>
+      <label for="${prefix}-name">名称<input id="${prefix}-name" name="name" required maxlength="120" value="${value("name")}" /></label></div>
+    <label for="${prefix}-description">设定<textarea id="${prefix}-description" name="description" maxlength="3000" rows="2">${value("description")}</textarea></label>
+    <label for="${prefix}-visual">视觉提示<textarea id="${prefix}-visual" name="visual_prompt" maxlength="3000" rows="2" placeholder="用于跨集保持外观、色彩或构图一致">${value("visual_prompt")}</textarea></label>
+    <label for="${prefix}-continuity">连续性备注<textarea id="${prefix}-continuity" name="continuity_notes" maxlength="3000" rows="2" placeholder="例如：右手腕始终佩戴旧表">${value("continuity_notes")}</textarea></label>
+    ${asset ? `<label class="series-archive-toggle"><input type="checkbox" name="archived" ${asset.archived ? "checked" : ""} />归档此资产（保留已有分集）</label>` : ""}
+    <p class="series-form-status" role="status" aria-live="polite"></p>
+    <div class="series-form-actions"><button class="button button-primary" type="submit">${asset ? "保存资产" : "添加资产"}</button></div>
+  </form>`;
+}
+
+function renderSeriesDetail(series) {
+  state.viewMode = "series-detail";
+  workspace.classList.remove("chat-workspace");
+  document.querySelector("#top-title").textContent = series.title;
+  const viewToggle = document.querySelector("#view-toggle");
+  viewToggle.hidden = true;
+  viewToggle.disabled = true;
+  syncModelControl();
+  const episodes = Array.isArray(series.episodes) ? series.episodes : [];
+  const assets = Array.isArray(series.assets) ? series.assets : [];
+  const continuityEntries = Array.isArray(series.continuity_entries) ? series.continuity_entries : [];
+  const approvedSources = episodes.flatMap((episode) => ["script", "prompt", "storyboard", "scenes"]
+    .filter((stageId) => episode.workflow?.[stageId]?.status === "approved" && episode.workflow?.[stageId]?.content)
+    .map((stageId) => ({
+      value: `${episode.id}::${stageId}`,
+      label: `EP${String(episode.episode_number || 0).padStart(2, "0")} · ${episode.title} · ${stageLabel(stageId)}`,
+    })));
+  const continuityKinds = { fact: "既定事实", event: "已发生事件", relationship: "关系变化", clue: "线索", open_thread: "未解线索", constraint: "创作约束" };
+  const continuityStatuses = { confirmed: "已确认", open: "待解决", resolved: "已解决", archived: "已归档" };
+  workspace.innerHTML = `
+    <section class="series-screen series-detail-screen">
+      <div class="series-detail-nav"><button class="record-back-button" id="back-to-series-list" type="button">← 返回系列列表</button>${series.archived ? '<span class="series-archive-badge">已归档 · 仍可查看</span>' : ""}</div>
+      <header class="series-heading series-detail-heading"><div><p class="section-kicker">短剧 / 漫剧系列</p><h1>${escapeHTML(series.title)}</h1><p>${escapeHTML(series.logline || "尚未填写系列梗概。")}</p></div>
+        <div class="series-heading-actions"><button class="button button-subtle" id="export-series" type="button">导出系列副本</button>
+          <button class="button button-primary" id="new-series-episode" type="button" ${series.archived ? "disabled" : ""}>新建分集</button></div></header>
+      <div class="series-detail-grid">
+        <section class="series-panel" aria-labelledby="series-settings-title"><h2 id="series-settings-title">系列设定</h2>
+          <form id="series-update-form" class="series-form">
+            <label for="series-title">系列名称<input id="series-title" name="title" required maxlength="120" value="${escapeHTML(series.title)}" /></label>
+            <label for="series-logline">一句话梗概<textarea id="series-logline" name="logline" maxlength="3000" rows="3">${escapeHTML(series.logline)}</textarea></label>
+            <label for="series-genre">题材<input id="series-genre" name="genre" maxlength="300" value="${escapeHTML(series.genre || "")}" /></label>
+            <label for="series-world-setting">世界设定<textarea id="series-world-setting" name="world_setting" maxlength="5000" rows="4">${escapeHTML(series.world_setting || "")}</textarea></label>
+            <label for="series-central-theme">核心主题<textarea id="series-central-theme" name="central_theme" maxlength="2000" rows="3">${escapeHTML(series.central_theme || "")}</textarea></label>
+            <label for="series-season-arc">季 / 主线弧光<textarea id="series-season-arc" name="season_arc" maxlength="5000" rows="4">${escapeHTML(series.season_arc || "")}</textarea></label>
+            <label for="series-character-arcs">主要人物弧光<textarea id="series-character-arcs" name="character_arcs" maxlength="5000" rows="4">${escapeHTML(series.character_arcs || "")}</textarea></label>
+            <label for="series-ending">计划结局<textarea id="series-ending" name="ending" maxlength="3000" rows="3">${escapeHTML(series.ending || "")}</textarea></label>
+            <label for="series-tone">叙事基调<input id="series-tone" name="tone" maxlength="1000" value="${escapeHTML(series.tone || "")}" /></label>
+            <label for="series-boundaries">内容边界<textarea id="series-boundaries" name="content_boundaries" maxlength="2000" rows="3">${escapeHTML(series.content_boundaries || "")}</textarea></label>
+            <label for="series-visual-style">系列视觉基调<textarea id="series-visual-style" name="visual_style" maxlength="2000" rows="3">${escapeHTML(series.visual_style)}</textarea></label>
+            <label for="series-notes">系列备注<textarea id="series-notes" name="notes" maxlength="5000" rows="3">${escapeHTML(series.notes)}</textarea></label>
+            <label class="series-archive-toggle"><input type="checkbox" name="archived" ${series.archived ? "checked" : ""} />归档系列（保留已有分集和资产）</label>
+            <button class="button button-primary" type="submit">保存系列设定</button>
+          </form>
+        </section>
+        <section class="series-panel" aria-labelledby="series-episodes-title"><div class="series-panel-heading"><div><h2 id="series-episodes-title">分集</h2><p>${episodes.length} 集，按集数排序</p></div></div>
+          ${episodes.length ? `<ol class="series-episode-list">${episodes.map((episode) => `<li><button type="button" data-open-episode="${escapeHTML(episode.id)}"><span>EP${String(episode.episode_number || 0).padStart(2, "0")}</span><strong>${escapeHTML(episode.title)}</strong></button><small>${escapeHTML(stageLabel(episode.active_stage))}${episode.archived ? " · 已从最近对话移除" : ""}</small></li>`).join("")}</ol>` : '<p class="series-panel-empty">系列还没有分集。新建分集后可逐步确认脚本、视觉设定与镜头任务。</p>'}
+        </section>
+      </div>
+      <section class="series-panel continuity-panel" aria-labelledby="series-continuity-title">
+        <div class="series-panel-heading"><div><h2 id="series-continuity-title">连续性台账</h2><p>仅已确认内容会作为事实，未解线索会提示模型保留；分集来源必须引用已确认步骤中的原文。</p></div></div>
+        <form id="new-continuity-entry" class="series-form" ${series.archived ? "hidden" : ""}>
+          <div class="form-row"><label for="continuity-kind">记录类型<select id="continuity-kind" name="kind">${Object.entries(continuityKinds).map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select></label>
+            <label for="continuity-status">状态<select id="continuity-status" name="status"><option value="confirmed">已确认</option><option value="open">待解决</option></select></label></div>
+          <label for="continuity-summary">事实 / 线索<textarea id="continuity-summary" name="summary" required maxlength="1200" rows="3" placeholder="例如：林澄已经知道录音带标签上的蓝色划痕与旧仓库有关。"></textarea></label>
+          <label for="continuity-source">来源分集步骤（可选）<select id="continuity-source"><option value="">人工补充（无分集引用）</option>${approvedSources.map((item) => `<option value="${escapeHTML(item.value)}">${escapeHTML(item.label)}</option>`).join("")}</select></label>
+          <label for="continuity-excerpt">已确认原文节选<textarea id="continuity-excerpt" maxlength="1000" rows="2" placeholder="需与所选步骤中的文字完全一致；不选来源时留空"></textarea></label>
+          <p class="series-form-status" role="status" aria-live="polite"></p><div class="series-form-actions"><button class="button button-primary" type="submit">添加台账记录</button></div>
+        </form>
+        ${continuityEntries.length ? `<div class="continuity-entry-list">${continuityEntries.map((entry) => {
+          const source = entry.source || {};
+          const sourceLabel = source.type === "episode" ? `EP${String(source.episode_number || 0).padStart(2, "0")} · ${stageLabel(source.stage)}` : "人工补充";
+          return `<form class="continuity-entry" data-continuity-entry="${escapeHTML(entry.id)}">
+            <header><div><span class="continuity-kind">${escapeHTML(continuityKinds[entry.kind] || entry.kind || "记录")}</span><small>${escapeHTML(sourceLabel)}</small></div><small>${escapeHTML(continuityStatuses[entry.status] || entry.status || "")}</small></header>
+            ${source.excerpt ? `<blockquote>${escapeHTML(source.excerpt)}</blockquote>` : ""}
+            <label for="continuity-entry-${escapeHTML(entry.id)}-summary">记录内容<textarea id="continuity-entry-${escapeHTML(entry.id)}-summary" name="summary" required maxlength="1200" rows="2">${escapeHTML(entry.summary || "")}</textarea></label>
+            <p class="series-form-status" role="status" aria-live="polite"></p><div class="form-row"><label for="continuity-entry-${escapeHTML(entry.id)}-status">状态<select id="continuity-entry-${escapeHTML(entry.id)}-status" name="status">${Object.entries(continuityStatuses).map(([value, label]) => `<option value="${value}" ${entry.status === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><button class="button button-subtle" type="submit">保存记录</button></div>
+            ${(entry.versions || []).length ? `<details><summary>历史修改（${entry.versions.length}）</summary><ol>${entry.versions.map((version) => `<li>${escapeHTML(continuityStatuses[version.status] || version.status)} · ${escapeHTML(version.summary)}</li>`).join("")}</ol></details>` : ""}
+          </form>`;
+        }).join("")}</div>` : '<p class="series-panel-empty">尚无连续性记录。可先登记已确认事实、关系变化和待解决线索。</p>'}
+      </section>
+      <section class="series-panel series-assets-panel" aria-labelledby="series-assets-title"><div class="series-panel-heading"><div><h2 id="series-assets-title">人物、场景与道具</h2><p>有效资产会作为连续性参考，用于本系列后续生成；每次最多带入 20 项。</p></div><button class="button button-subtle" id="show-series-asset-form" type="button" ${series.archived ? "disabled" : ""}>添加资产</button></div>
+        <div id="new-series-asset-host" hidden>${renderSeriesAssetForm()}</div>
+        ${assets.length ? `<div class="series-asset-list">${assets.map((asset) => `<details class="series-asset-item" ${asset.archived ? "" : ""}><summary><span>${seriesAssetKindLabel(asset.kind)}</span><strong>${escapeHTML(asset.name)}</strong>${asset.archived ? '<small class="series-archive-badge">已归档</small>' : ""}</summary>${renderSeriesAssetForm(asset)}</details>`).join("")}</div>` : '<p class="series-panel-empty">还没有资产。可先登记主角外观、常驻场景或关键道具。</p>'}
+      </section>
+    </section>`;
+  workspace.querySelector("#back-to-series-list").addEventListener("click", showSeriesLibrary);
+  workspace.querySelector("#export-series").addEventListener("click", () => exportSeriesBundle(series.id));
+  workspace.querySelector("#new-series-episode").addEventListener("click", () => {
+    if (series.archived) return;
+    state.selectedSeriesId = series.id;
+    showNotice("");
+    renderWorkflowSetup();
+    renderProjects();
+    document.querySelector("#project-track").value = "drama";
+    updateWorkflowTrackCopy("drama");
+    document.querySelector("#series-select").value = series.id;
+  });
+  workspace.querySelector("#series-update-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const payload = Object.fromEntries(new FormData(form).entries());
+    payload.archived = form.elements.archived.checked;
+    const submit = form.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+      await api(`/api/series/${encodeURIComponent(series.id)}`, { method: "PUT", body: JSON.stringify(payload) });
+      await refreshSeries();
+      await openSeriesDetail(series.id);
+      showNotice("系列设定已保存。", false);
+    } catch (error) {
+      showNotice(error.message, true);
+      submit.disabled = false;
+    }
+  });
+  const newContinuityForm = workspace.querySelector("#new-continuity-entry");
+  newContinuityForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const payload = Object.fromEntries(new FormData(form).entries());
+    const sourceValue = workspace.querySelector("#continuity-source").value;
+    if (sourceValue) {
+      const [sourceProjectId, sourceStage] = sourceValue.split("::");
+      payload.source_project_id = sourceProjectId;
+      payload.source_stage = sourceStage;
+      payload.source_excerpt = workspace.querySelector("#continuity-excerpt").value;
+    }
+    const submit = form.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+      await api(`/api/series/${encodeURIComponent(series.id)}/continuity`, { method: "POST", body: JSON.stringify(payload) });
+      await refreshSeries();
+      await openSeriesDetail(series.id);
+      showNotice("连续性记录已保存；只有已确认内容会作为故事事实传入后续分集。", false);
+    } catch (error) {
+      form.querySelector(".series-form-status").textContent = error.message;
+      submit.disabled = false;
+    }
+  });
+  workspace.querySelectorAll("[data-continuity-entry]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const currentForm = event.currentTarget;
+      const payload = Object.fromEntries(new FormData(currentForm).entries());
+      const submit = currentForm.querySelector('[type="submit"]');
+      submit.disabled = true;
+      try {
+        await api(`/api/series/${encodeURIComponent(series.id)}/continuity/${encodeURIComponent(currentForm.dataset.continuityEntry)}`, {
+          method: "PUT", body: JSON.stringify(payload),
+        });
+        await refreshSeries();
+        await openSeriesDetail(series.id);
+        showNotice("连续性记录已更新，旧版内容保留在历史中。", false);
+      } catch (error) {
+        currentForm.querySelector(".series-form-status").textContent = error.message;
+        submit.disabled = false;
+      }
+    });
+  });
+  const newAssetHost = workspace.querySelector("#new-series-asset-host");
+  workspace.querySelector("#show-series-asset-form").addEventListener("click", () => {
+    newAssetHost.hidden = false;
+    newAssetHost.querySelector('[name="name"]').focus();
+  });
+  const createAssetForm = workspace.querySelector("#new-series-asset-form");
+  createAssetForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const submit = form.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+      await api(`/api/series/${encodeURIComponent(series.id)}/assets`, { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(form).entries())) });
+      await refreshSeries();
+      await openSeriesDetail(series.id);
+      showNotice("系列资产已添加。", false);
+    } catch (error) {
+      form.querySelector(".series-form-status").textContent = error.message;
+      submit.disabled = false;
+    }
+  });
+  workspace.querySelectorAll("[data-series-asset-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const currentForm = event.currentTarget;
+      const payload = Object.fromEntries(new FormData(currentForm).entries());
+      payload.archived = currentForm.elements.archived.checked;
+      const submit = currentForm.querySelector('[type="submit"]');
+      submit.disabled = true;
+      try {
+        await api(`/api/series/${encodeURIComponent(series.id)}/assets/${encodeURIComponent(currentForm.dataset.seriesAssetForm)}`, { method: "PUT", body: JSON.stringify(payload) });
+        await refreshSeries();
+        await openSeriesDetail(series.id);
+        showNotice("系列资产已保存。", false);
+      } catch (error) {
+        currentForm.querySelector(".series-form-status").textContent = error.message;
+        submit.disabled = false;
+      }
+    });
+  });
+  workspace.querySelectorAll("[data-open-episode]").forEach((button) => {
+    button.addEventListener("click", () => openProductionRecord(button.dataset.openEpisode));
+  });
 }
 
 async function refreshProjects() {
@@ -1158,8 +1625,17 @@ async function createProject(event) {
   const payload = Object.fromEntries(formData.entries());
   payload.duration_seconds = Number(payload.duration_seconds);
   payload.model = state.selectedModel || state.config.default_model;
+  if (!payload.series_id) {
+    delete payload.series_id;
+    delete payload.episode_number;
+  } else if (payload.episode_number) {
+    payload.episode_number = Number(payload.episode_number);
+  } else {
+    delete payload.episode_number;
+  }
   try {
     state.project = await api("/api/projects", { method: "POST", body: JSON.stringify(payload) });
+    state.selectedSeriesId = null;
     state.viewStage = state.project.active_stage;
     showNotice("");
     await refreshProjects();
@@ -1307,6 +1783,47 @@ async function generateShotAsset(shotId, kind) {
     } catch {
       if (button) button.disabled = false;
     }
+  }
+}
+
+async function runStageQualityCheck() {
+  if (!state.project || !state.viewStage) return;
+  const button = workspace.querySelector("#run-quality-check");
+  const results = workspace.querySelector("#quality-results");
+  if (button) button.disabled = true;
+  if (results) results.textContent = "正在运行启发式检查…";
+  try {
+    const report = await api(`/api/projects/${encodeURIComponent(state.project.id)}/quality/${encodeURIComponent(state.viewStage)}`, { method: "POST" });
+    if (!results) return;
+    const findings = Array.isArray(report.findings) ? report.findings : [];
+    results.innerHTML = `<strong>${escapeHTML(report.grade)} · ${escapeHTML(report.score)}/100 · 仅供参考</strong>${findings.length
+      ? `<ul>${findings.map((finding) => `<li class="is-${escapeHTML(finding.severity)}"><strong>${escapeHTML(finding.title)}</strong>：${escapeHTML(finding.message)}</li>`).join("")}</ul>`
+      : "<p>未发现明显的格式或占位问题，请继续人工审阅内容质量。</p>"}`;
+  } catch (error) {
+    if (results) results.textContent = error.message;
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
+}
+
+async function restoreStageRevision(stage, revisionId) {
+  if (!state.project || !revisionId) return;
+  const confirmed = await confirmInApp({
+    title: "恢复历史内容？",
+    message: "历史内容将替换当前步骤；当前内容会先归档，后续步骤会标记为过期并需要重新审阅。",
+    confirmLabel: "恢复历史版本",
+    cancelLabel: "保留当前内容",
+  });
+  if (!confirmed) return;
+  const projectId = state.project.id;
+  try {
+    state.project = await api(`/api/projects/${encodeURIComponent(projectId)}/content/${encodeURIComponent(stage)}/revisions/${encodeURIComponent(revisionId)}/restore`, { method: "POST" });
+    state.viewStage = stage;
+    await refreshProjects();
+    renderProject();
+    showNotice("历史内容已恢复；当前内容已留档，后续步骤已标记为过期。", false);
+  } catch (error) {
+    showNotice(error.message, true);
   }
 }
 
@@ -1489,6 +2006,7 @@ function renderChatScreen({ preserveDraft = false } = {}) {
   const conversationLabel = isWorkflowProject ? "项目对话" : "普通对话";
   workspace.innerHTML = `
     <section class="chat-screen" aria-label="${conversationLabel}">
+      ${project ? `<div class="chat-project-tools"><span>${conversationLabel} · 本地副本</span><a href="/api/projects/${encodeURIComponent(project.id)}/export">导出项目副本</a></div>` : ""}
       <div id="chat-messages" class="chat-messages" role="log" aria-label="对话记录" aria-live="polite" aria-relevant="additions text"></div>
       <div class="chat-composer-area">
         <p id="chat-status" class="chat-status" role="status" aria-live="polite"></p>
@@ -2024,6 +2542,29 @@ async function refreshUsageSummary() {
   }
 }
 
+function renderVideoJobsSummary(data) {
+  const host = document.querySelector("#video-jobs-summary");
+  if (!host) return;
+  const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+  const workerStatus = data.worker_running ? "后台工作线程运行中" : "后台工作线程未运行";
+  host.innerHTML = `<p>${escapeHTML(workerStatus)} · ${jobs.length} 个需关注任务</p>${jobs.length
+    ? `<div class="video-job-list">${jobs.slice().reverse().map((job) => `<article class="video-job-row">
+      <strong>${escapeHTML(job.project_title || "未命名项目")} · ${escapeHTML(job.shot_id || "镜头未知")} · ${escapeHTML(job.status || "未知状态")}</strong>
+      <small>更新于 ${escapeHTML(recordDate(job.updated_at || job.created_at))}${job.next_poll_at ? ` · 下次查询 ${escapeHTML(recordDate(job.next_poll_at))}` : ""}</small>
+      ${job.error ? `<p>${escapeHTML(job.error)}</p>` : ""}</article>`).join("")}</div>`
+    : '<p class="usage-empty">目前没有需关注的排队、失败或中断任务。</p>'}`;
+}
+
+async function refreshVideoJobsSummary() {
+  const host = document.querySelector("#video-jobs-summary");
+  if (host) host.textContent = "正在读取本地任务…";
+  try {
+    renderVideoJobsSummary(await api("/api/video-jobs"));
+  } catch (error) {
+    if (host) host.textContent = error.message;
+  }
+}
+
 function selectedCleanupItems() {
   const host = document.querySelector("#storage-cleanup-list");
   if (!host) return { attachment_ids: [], storage_keys: [] };
@@ -2106,14 +2647,22 @@ async function confirmStorageCleanup() {
 
 async function showUsageSettings() {
   if (!usageDialog.open) usageDialog.showModal();
-  await Promise.all([refreshUsageSummary(), previewStorageCleanup()]);
+  await Promise.all([refreshUsageSummary(), refreshVideoJobsSummary(), previewStorageCleanup()]);
+}
+
+function announceBackupExport() {
+  const status = document.querySelector("#backup-export-status");
+  if (status) status.textContent = "正在生成备份；生成完成后请在浏览器下载列表确认文件。";
 }
 
 async function initialize() {
   try {
-    [state.config, state.projects, state.skills] = await Promise.all([
-      api("/api/config"), api("/api/projects"), api("/api/skills"),
+    let compatibility;
+    [state.config, state.projects, state.skills, state.series, compatibility] = await Promise.all([
+      api("/api/config"), api("/api/projects"), api("/api/skills"), api("/api/series"),
+      api("/api/system/status").catch(() => null),
     ]);
+    showCompatibilityStatus(compatibility);
     state.skillCount = state.skills.length;
     state.selectedModel = state.config.default_model;
     const configured = state.config.configured_modalities;
@@ -2128,9 +2677,11 @@ async function initialize() {
     document.querySelector("#view-toggle").addEventListener("click", toggleProjectView);
     document.querySelector("#open-models").addEventListener("click", showModelSettings);
     document.querySelector("#open-usage").addEventListener("click", showUsageSettings);
+    document.querySelector("#export-backup").addEventListener("click", announceBackupExport);
     document.querySelector("#preview-storage-cleanup").addEventListener("click", previewStorageCleanup);
     document.querySelector("#confirm-storage-cleanup").addEventListener("click", confirmStorageCleanup);
     document.querySelector("#storage-cleanup-list").addEventListener("change", updateCleanupButton);
+    document.querySelector("#refresh-video-jobs").addEventListener("click", refreshVideoJobsSummary);
     document.querySelector("#add-model").addEventListener("click", () => openModelEditor());
     document.querySelector("#model-profiles").addEventListener("click", (event) => {
       const edit = event.target.closest("[data-model-edit]");
@@ -2160,7 +2711,9 @@ async function initialize() {
     document.querySelector("#rename-form").addEventListener("submit", saveProjectTitle);
     document.querySelector("#rename-cancel").addEventListener("click", () => renameDialog.close());
     document.querySelector("#open-records")?.addEventListener("click", showProductionRecords);
+    document.querySelector("#open-series")?.addEventListener("click", showSeriesLibrary);
     document.querySelector("#new-project").addEventListener("click", () => {
+      state.selectedSeriesId = null;
       clearPendingUploads();
       state.project = null;
       state.viewStage = null;
@@ -2174,6 +2727,7 @@ async function initialize() {
       document.querySelector("#chat-input")?.focus();
     });
     document.querySelector("#new-workflow").addEventListener("click", () => {
+      state.selectedSeriesId = null;
       clearPendingUploads();
       showNotice("");
       renderWorkflowSetup();

@@ -13,6 +13,10 @@ class VideoJobConflict(RuntimeError):
     pass
 
 
+class SeriesEpisodeConflict(RuntimeError):
+    pass
+
+
 class ProjectStore:
     def __init__(self, database_path: Path):
         self.database_path = database_path
@@ -45,6 +49,36 @@ class ProjectStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     payload TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS series (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS series_assets (
+                    id TEXT PRIMARY KEY,
+                    series_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_series_assets_series_created "
+                "ON series_assets(series_id, created_at)"
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS series_episodes (
+                    series_id TEXT NOT NULL,
+                    episode_number INTEGER NOT NULL,
+                    project_id TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(series_id, episode_number)
                 )"""
             )
             connection.execute(
@@ -131,6 +165,185 @@ class ProjectStore:
         with self._connection() as connection:
             self._save_project_record(connection, project)
         return project
+
+    def import_project_bundle(
+        self,
+        project: dict[str, Any],
+        *,
+        messages: list[dict[str, Any]],
+        attachments: list[dict[str, Any]],
+        series: dict[str, Any] | None = None,
+        series_assets: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Insert a fully remapped project bundle without overwriting existing records."""
+        series_assets = series_assets or []
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if series:
+                connection.execute(
+                    "INSERT INTO series (id, created_at, updated_at, payload) VALUES (?, ?, ?, ?)",
+                    (series["id"], series["created_at"], series["updated_at"], json.dumps(series, ensure_ascii=False)),
+                )
+                for asset in series_assets:
+                    connection.execute(
+                        "INSERT INTO series_assets (id, series_id, created_at, updated_at, payload) VALUES (?, ?, ?, ?, ?)",
+                        (asset["id"], asset["series_id"], asset["created_at"], asset["updated_at"], json.dumps(asset, ensure_ascii=False)),
+                    )
+            connection.execute(
+                "INSERT INTO projects (id, created_at, updated_at, payload) VALUES (?, ?, ?, ?)",
+                (project["id"], project["created_at"], project["updated_at"], json.dumps(project, ensure_ascii=False)),
+            )
+            if series and project.get("series_id"):
+                episode_number = project.get("episode_number")
+                if episode_number is None:
+                    row = connection.execute(
+                        "SELECT COALESCE(MAX(episode_number), 0) + 1 AS next_number FROM series_episodes WHERE series_id = ?",
+                        (project["series_id"],),
+                    ).fetchone()
+                    episode_number = int(row["next_number"])
+                    project["episode_number"] = episode_number
+                    self._save_project_record(connection, project)
+                connection.execute(
+                    "INSERT INTO series_episodes (series_id, episode_number, project_id, created_at) VALUES (?, ?, ?, ?)",
+                    (project["series_id"], episode_number, project["id"], project["created_at"]),
+                )
+            for message in messages:
+                connection.execute(
+                    "INSERT INTO chat_messages (id, project_id, created_at, payload) VALUES (?, ?, ?, ?)",
+                    (message["id"], project["id"], message["created_at"], json.dumps(message, ensure_ascii=False)),
+                )
+            for attachment in attachments:
+                connection.execute(
+                    "INSERT INTO chat_attachments (id, project_id, created_at, payload) VALUES (?, ?, ?, ?)",
+                    (attachment["id"], project["id"], attachment["created_at"], json.dumps(attachment, ensure_ascii=False)),
+                )
+        return project
+
+    def import_series_bundle(
+        self,
+        series: dict[str, Any],
+        assets: list[dict[str, Any]],
+        episodes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Insert a complete remapped season atomically without overwriting existing rows."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO series (id, created_at, updated_at, payload) VALUES (?, ?, ?, ?)",
+                (series["id"], series["created_at"], series["updated_at"], json.dumps(series, ensure_ascii=False)),
+            )
+            for asset in assets:
+                connection.execute(
+                    "INSERT INTO series_assets (id, series_id, created_at, updated_at, payload) VALUES (?, ?, ?, ?, ?)",
+                    (asset["id"], asset["series_id"], asset["created_at"], asset["updated_at"], json.dumps(asset, ensure_ascii=False)),
+                )
+            for record in episodes:
+                project = record["project"]
+                connection.execute(
+                    "INSERT INTO projects (id, created_at, updated_at, payload) VALUES (?, ?, ?, ?)",
+                    (project["id"], project["created_at"], project["updated_at"], json.dumps(project, ensure_ascii=False)),
+                )
+                connection.execute(
+                    "INSERT INTO series_episodes (series_id, episode_number, project_id, created_at) VALUES (?, ?, ?, ?)",
+                    (project["series_id"], project["episode_number"], project["id"], project["created_at"]),
+                )
+                for message in record["messages"]:
+                    connection.execute(
+                        "INSERT INTO chat_messages (id, project_id, created_at, payload) VALUES (?, ?, ?, ?)",
+                        (message["id"], project["id"], message["created_at"], json.dumps(message, ensure_ascii=False)),
+                    )
+                for attachment in record["attachments"]:
+                    connection.execute(
+                        "INSERT INTO chat_attachments (id, project_id, created_at, payload) VALUES (?, ?, ?, ?)",
+                        (attachment["id"], project["id"], attachment["created_at"], json.dumps(attachment, ensure_ascii=False)),
+                    )
+        return {"series": series, "assets": assets, "episodes": episodes}
+
+    def save_series(self, series: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT INTO series (id, created_at, updated_at, payload)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     updated_at = excluded.updated_at, payload = excluded.payload""",
+                (series["id"], series["created_at"], series["updated_at"], json.dumps(series, ensure_ascii=False)),
+            )
+        return series
+
+    def get_series(self, series_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT payload FROM series WHERE id = ?", (series_id,)).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def list_series(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute("SELECT payload FROM series ORDER BY updated_at DESC, id").fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def save_series_asset(self, asset: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT INTO series_assets (id, series_id, created_at, updated_at, payload)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     updated_at = excluded.updated_at, payload = excluded.payload""",
+                (
+                    asset["id"], asset["series_id"], asset["created_at"], asset["updated_at"],
+                    json.dumps(asset, ensure_ascii=False),
+                ),
+            )
+        return asset
+
+    def get_series_asset(self, series_id: str, asset_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM series_assets WHERE series_id = ? AND id = ?",
+                (series_id, asset_id),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def list_series_assets(self, series_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM series_assets WHERE series_id = ? ORDER BY created_at, id",
+                (series_id,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def save_series_episode(
+        self, project: dict[str, Any], series_id: str, episode_number: int | None = None
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if episode_number is None:
+                row = connection.execute(
+                    "SELECT COALESCE(MAX(episode_number), 0) + 1 AS next_number "
+                    "FROM series_episodes WHERE series_id = ?",
+                    (series_id,),
+                ).fetchone()
+                episode_number = int(row["next_number"])
+            project["series_id"] = series_id
+            project["episode_number"] = episode_number
+            try:
+                connection.execute(
+                    "INSERT INTO series_episodes (series_id, episode_number, project_id, created_at) VALUES (?, ?, ?, ?)",
+                    (series_id, episode_number, project["id"], project["created_at"]),
+                )
+            except sqlite3.IntegrityError as error:
+                raise SeriesEpisodeConflict("该系列已存在这个集数，请选择其他集数。") from error
+            self._save_project_record(connection, project)
+        return project
+
+    def list_series_episodes(self, series_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT projects.payload FROM series_episodes
+                   JOIN projects ON projects.id = series_episodes.project_id
+                   WHERE series_episodes.series_id = ?
+                   ORDER BY series_episodes.episode_number, series_episodes.project_id""",
+                (series_id,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
 
     def enqueue_video_job(self, project: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
         with self._connection() as connection:
@@ -501,6 +714,14 @@ class ProjectStore:
                 for row in rows:
                     collect(json.loads(row["payload"]))
         return references
+
+    def list_chat_messages(self, project_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM chat_messages WHERE project_id = ? ORDER BY created_at, id",
+                (project_id,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
 
     def chat_history(self, project_id: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._connection() as connection:

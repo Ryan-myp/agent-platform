@@ -5,10 +5,12 @@ import json
 import os
 import queue
 import re
+import shutil
 import tempfile
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -18,6 +20,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from app.config import Settings
 from app.models import (
@@ -29,6 +32,12 @@ from app.models import (
     ModelUpdate,
     ProjectCreate,
     ProjectTitleUpdate,
+    SeriesAssetCreate,
+    SeriesAssetUpdate,
+    SeriesCreate,
+    SeriesContinuityCreate,
+    SeriesContinuityUpdate,
+    SeriesUpdate,
     StorageCleanupRequest,
 )
 from app.providers.media import AssetStore, ImageProvider, MediaProviderError, VideoProvider, create_audio_provider
@@ -39,14 +48,21 @@ from app.services.attachments import (
     ChatAttachmentError,
     ChatAttachmentService,
 )
+from app.services.backup import BackupError, create_backup_archive
 from app.services.chat import ChatService
 from app.services.workflow import WorkflowError, WorkflowService
 from app.services.video_jobs import VideoJobWorker
 from app.services.usage import UsageService
+from app.services.series import SeriesError, SeriesService
+from app.services.project_transfer import ProjectTransferError, ProjectTransferService
+from app.services.quality import QualityService
+from app.services.delivery import DeliveryPackageError, DeliveryService
+from app.services.series_transfer import SeriesTransferService
 from app.skills.loader import SkillLoader
 from app.store import ProjectStore
 
 ROOT = Path(__file__).resolve().parent.parent
+API_CONTRACT_VERSION = 3
 _SECRET_PARAM_NAMES = {"api_key", "apikey", "authorization", "access_token", "refresh_token", "secret"}
 
 
@@ -69,6 +85,22 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _is_same_origin_request(request: Request) -> bool:
+    host = request.headers.get("host", "").lower()
+    origin = request.headers.get("origin")
+    if origin:
+        parsed_origin = urlparse(origin)
+        return parsed_origin.scheme == request.url.scheme and parsed_origin.netloc.lower() == host
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site:
+        return fetch_site.lower() == "same-origin"
+    referer = request.headers.get("referer")
+    if referer:
+        parsed_referer = urlparse(referer)
+        return parsed_referer.scheme == request.url.scheme and parsed_referer.netloc.lower() == host
+    return False
 
 
 def _build_model_catalog(
@@ -165,6 +197,11 @@ def create_app(
     workflow.video_job_worker = video_job_worker
     chat_attachments = ChatAttachmentService(store, assets)
     chat = ChatService(store, current_settings, assets, chat_attachments, usage)
+    series = SeriesService(store)
+    project_transfer = ProjectTransferService(store, assets)
+    delivery = DeliveryService(store, assets)
+    quality = QualityService(store)
+    series_transfer = SeriesTransferService(store, project_transfer)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -184,7 +221,12 @@ def create_app(
     application.state.chat = chat
     application.state.chat_attachments = chat_attachments
     application.state.usage = usage
+    application.state.series = series
     application.state.assets = assets
+    application.state.project_transfer = project_transfer
+    application.state.delivery = delivery
+    application.state.quality = quality
+    application.state.series_transfer = series_transfer
     application.state.model_credentials = credential_store
     application.state.video_job_worker = video_job_worker
     catalog_update_lock = threading.Lock()
@@ -199,13 +241,35 @@ def create_app(
             return JSONResponse(status_code=422, content={"detail": details})
         return await request_validation_exception_handler(request, error)
 
+    @application.middleware("http")
+    async def reject_cross_origin_writes(request: Request, call_next):
+        if request.url.path.startswith("/api/") and request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origin = request.headers.get("origin")
+            fetch_site = request.headers.get("sec-fetch-site", "").lower()
+            if (origin and not _is_same_origin_request(request)) or fetch_site == "cross-site":
+                return JSONResponse(status_code=403, content={"detail": "跨来源写入请求已拒绝。"})
+        return await call_next(request)
+
+    @application.middleware("http")
+    async def protect_local_media(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/media/"):
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            if Path(request.url.path).suffix.lower() in {
+                ".html", ".htm", ".xhtml", ".svg", ".xml", ".json", ".yaml", ".yml",
+                ".txt", ".md", ".csv", ".log", ".pdf", ".docx", ".js", ".mjs", ".css",
+            }:
+                response.headers["Content-Disposition"] = "attachment"
+                response.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+        return response
+
     application.mount("/static", StaticFiles(directory=ROOT / "app" / "static"), name="static")
     application.mount("/media", StaticFiles(directory=media_path, check_dir=False), name="media")
 
     def run(action, *args: Any, **kwargs: Any):
         try:
             return action(*args, **kwargs)
-        except WorkflowError as error:
+        except (WorkflowError, SeriesError) as error:
             raise HTTPException(status_code=error.status_code, detail=str(error)) from error
 
     @application.get("/", include_in_schema=False)
@@ -216,16 +280,68 @@ def create_app(
         )
 
     @application.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, Any]:
+        return {"status": "ok", "app_version": application.version, "api_contract_version": API_CONTRACT_VERSION}
+
+    @application.get("/api/system/status")
+    def system_status() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "app_version": application.version,
+            "api_contract_version": API_CONTRACT_VERSION,
+            "features": ["series", "series_transfer", "story_continuity_ledger", "quality_checks", "video_jobs", "content_revisions", "production_delivery"],
+            "video_job_worker_running": video_job_worker.is_running,
+        }
 
     @application.get("/api/config")
     def get_config() -> dict:
         return workflow.config_view()
 
+    @application.get("/api/backup/export")
+    def export_backup(request: Request) -> FileResponse:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host) or not _is_same_origin_request(request):
+            raise HTTPException(status_code=403, detail="备份导出仅允许从本机工作台发起。")
+        temp_directory = Path(tempfile.mkdtemp(prefix="agent-platform-export-"))
+        filename = f"agent-platform-backup-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.zip"
+        output_path = temp_directory / filename
+        try:
+            create_backup_archive(current_settings.database_path, media_path, output_path)
+        except BackupError as error:
+            shutil.rmtree(temp_directory, ignore_errors=True)
+            raise HTTPException(status_code=500, detail=f"创建备份失败：{error}") from error
+        return FileResponse(
+            output_path,
+            media_type="application/zip",
+            filename=filename,
+            headers={"Cache-Control": "no-store, max-age=0"},
+            background=BackgroundTask(shutil.rmtree, temp_directory, ignore_errors=True),
+        )
+
     @application.get("/api/usage")
     def get_usage() -> dict:
         return usage.summary()
+
+    @application.get("/api/video-jobs")
+    def list_video_jobs() -> dict[str, Any]:
+        statuses = {"queued", "submitting", "polling", "timed_out", "stalled", "interrupted", "failed"}
+        projects = {item["id"]: item for item in store.list()}
+        jobs = []
+        for job in store.list_video_jobs(statuses):
+            project = projects.get(job.get("project_id"), {})
+            jobs.append({
+                "id": job.get("id"),
+                "project_id": job.get("project_id"),
+                "project_title": project.get("title", "已删除项目"),
+                "shot_id": job.get("shot_id"),
+                "status": job.get("status"),
+                "created_at": job.get("created_at"),
+                "updated_at": job.get("updated_at"),
+                "next_poll_at": job.get("next_poll_at"),
+                "error": job.get("error"),
+                "provider_task_id": job.get("provider_task_id"),
+            })
+        return {"worker_running": video_job_worker.is_running, "jobs": jobs[-100:]}
 
     @application.get("/api/storage/cleanup/preview")
     def preview_storage_cleanup() -> dict:
@@ -338,6 +454,80 @@ def create_app(
     def get_skills() -> list[dict[str, str]]:
         return skill_loader.list_skills()
 
+    @application.get("/api/series")
+    def list_series() -> list[dict]:
+        return series.list_series()
+
+    @application.post("/api/series", status_code=201)
+    def create_series(payload: SeriesCreate) -> dict:
+        return run(series.create_series, payload.model_dump())
+
+    @application.get("/api/series/{series_id}")
+    def get_series(series_id: str) -> dict:
+        return run(series.get_series, series_id)
+
+    @application.get("/api/series/{series_id}/export")
+    def export_series(series_id: str, request: Request) -> FileResponse:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host) or not _is_same_origin_request(request):
+            raise HTTPException(status_code=403, detail="系列导出仅允许从本机工作台发起。")
+        temp_directory = Path(tempfile.mkdtemp(prefix="agent-platform-series-export-"))
+        output_path = temp_directory / f"agent-platform-series-{series_id[:12]}.zip"
+        try:
+            series_transfer.create_export(series_id, output_path)
+        except ProjectTransferError as error:
+            shutil.rmtree(temp_directory, ignore_errors=True)
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        return FileResponse(
+            output_path,
+            media_type="application/zip",
+            filename=output_path.name,
+            headers={"Cache-Control": "no-store, max-age=0"},
+            background=BackgroundTask(shutil.rmtree, temp_directory, ignore_errors=True),
+        )
+
+    @application.post("/api/series/import", status_code=201)
+    def import_series(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host) or not _is_same_origin_request(request):
+            raise HTTPException(status_code=403, detail="系列导入仅允许从本机工作台发起。")
+        if file.size is not None and file.size > 512 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="系列导入包超过 512 MiB 限制。")
+        try:
+            return series_transfer.import_bundle(file.file)
+        except ProjectTransferError as error:
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+
+    @application.put("/api/series/{series_id}")
+    def update_series(series_id: str, payload: SeriesUpdate) -> dict:
+        return run(series.update_series, series_id, payload.model_dump(exclude_unset=True, exclude_none=True))
+
+    @application.post("/api/series/{series_id}/continuity", status_code=201)
+    def create_series_continuity(series_id: str, payload: SeriesContinuityCreate) -> dict:
+        return run(series.create_continuity_entry, series_id, payload.model_dump())
+
+    @application.put("/api/series/{series_id}/continuity/{entry_id}")
+    def update_series_continuity(series_id: str, entry_id: str, payload: SeriesContinuityUpdate) -> dict:
+        return run(
+            series.update_continuity_entry,
+            series_id,
+            entry_id,
+            payload.model_dump(exclude_unset=True, exclude_none=True),
+        )
+
+    @application.post("/api/series/{series_id}/assets", status_code=201)
+    def create_series_asset(series_id: str, payload: SeriesAssetCreate) -> dict:
+        return run(series.create_asset, series_id, payload.model_dump())
+
+    @application.put("/api/series/{series_id}/assets/{asset_id}")
+    def update_series_asset(series_id: str, asset_id: str, payload: SeriesAssetUpdate) -> dict:
+        return run(
+            series.update_asset,
+            series_id,
+            asset_id,
+            payload.model_dump(exclude_unset=True, exclude_none=True),
+        )
+
     @application.get("/api/projects")
     def list_projects() -> list[dict]:
         return workflow.list_projects()
@@ -353,6 +543,61 @@ def create_app(
     @application.get("/api/projects/{project_id}")
     def get_project(project_id: str) -> dict:
         return run(workflow.get_project, project_id)
+
+    @application.get("/api/projects/{project_id}/export")
+    def export_project(project_id: str, request: Request) -> FileResponse:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host) or not _is_same_origin_request(request):
+            raise HTTPException(status_code=403, detail="项目导出仅允许从本机工作台发起。")
+        temp_directory = Path(tempfile.mkdtemp(prefix="agent-platform-project-export-"))
+        filename = f"agent-platform-project-{project_id[:12]}.zip"
+        output_path = temp_directory / filename
+        try:
+            project_transfer.create_export(project_id, output_path)
+        except ProjectTransferError as error:
+            shutil.rmtree(temp_directory, ignore_errors=True)
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        return FileResponse(
+            output_path,
+            media_type="application/zip",
+            filename=filename,
+            headers={"Cache-Control": "no-store, max-age=0"},
+            background=BackgroundTask(shutil.rmtree, temp_directory, ignore_errors=True),
+        )
+
+    @application.get("/api/projects/{project_id}/delivery")
+    def export_delivery_package(project_id: str, request: Request) -> FileResponse:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host) or not _is_same_origin_request(request):
+            raise HTTPException(status_code=403, detail="制作交付包仅允许从本机工作台下载。")
+        temp_directory = Path(tempfile.mkdtemp(prefix="agent-platform-delivery-"))
+        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", project_id)[:12] or "project"
+        filename = f"agent-platform-delivery-{safe_id}.zip"
+        output_path = temp_directory / filename
+        try:
+            delivery.create_package(project_id, output_path)
+        except DeliveryPackageError as error:
+            shutil.rmtree(temp_directory, ignore_errors=True)
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        return FileResponse(
+            output_path,
+            media_type="application/zip",
+            filename=filename,
+            headers={"Cache-Control": "no-store, max-age=0"},
+            background=BackgroundTask(shutil.rmtree, temp_directory, ignore_errors=True),
+        )
+
+    @application.post("/api/projects/import", status_code=201)
+    def import_project(request: Request, file: UploadFile = File(...)) -> dict:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host) or not _is_same_origin_request(request):
+            raise HTTPException(status_code=403, detail="项目导入仅允许从本机工作台发起。")
+        if file.size is not None and file.size > 512 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="项目导入包超过 512 MiB 限制。")
+        try:
+            return project_transfer.import_bundle(file.file)
+        except ProjectTransferError as error:
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
 
     @application.put("/api/projects/{project_id}/title")
     def rename_project(project_id: str, payload: ProjectTitleUpdate) -> dict:
@@ -399,6 +644,27 @@ def create_app(
     @application.post("/api/projects/{project_id}/shots/{shot_id}/video/resume")
     def resume_shot_video_polling(project_id: str, shot_id: str) -> dict:
         return run(workflow.resume_shot_video_polling, project_id, shot_id)
+
+    @application.get("/api/projects/{project_id}/content/{stage}/revisions")
+    def list_content_revisions(project_id: str, stage: str) -> dict[str, Any]:
+        project = run(workflow.get_project, project_id)
+        if stage not in project.get("workflow", {}):
+            raise HTTPException(status_code=404, detail="未知的创作步骤。")
+        revisions = project["workflow"][stage].get("revisions", [])
+        return {"project_id": project_id, "stage": stage, "revisions": revisions}
+
+    @application.post("/api/projects/{project_id}/content/{stage}/revisions/{revision_id}/restore")
+    def restore_content_revision(project_id: str, stage: str, revision_id: str) -> dict:
+        return run(workflow.restore_revision, project_id, stage, revision_id)
+
+    @application.post("/api/projects/{project_id}/quality/{stage}")
+    def check_content_quality(project_id: str, stage: str) -> dict[str, Any]:
+        try:
+            return quality.check(project_id, stage)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
 
     @application.put("/api/projects/{project_id}/content/{stage}")
     def update_content(project_id: str, stage: str, payload: ContentUpdate) -> dict:

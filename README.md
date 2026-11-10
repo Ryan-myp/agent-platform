@@ -1,6 +1,6 @@
 # 片场 · 多模态内容创作台
 
-支持品牌营销视频与短剧 / 漫剧两条创作路线的本地内容创作平台。左侧提供「新对话」「创作流程」和「制作记录」入口：普通对话支持持续讨论、图片/视频/文件附件理解，并可生成图片、短视频或语音；涉及媒体生成时，助手会先说明生成内容并等待用户确认。创作流程选择内容类型并填写 brief，再按脚本、视觉设定、分镜、逐镜任务和视频片段逐步确认。工作流草稿可编辑，未经确认不会推进；已确认步骤也可回退修改或重新生成。上游修改后，后续内容与媒体素材会保留并标记为过期，重新确认后可逐步重生成；被覆盖的文本草稿可从历史版本恢复。确认镜头任务后，可逐镜生成/重试关键帧和视频片段，并查看 AI 剪辑方案、素材版本及供应商实际返回的任务/费用信息。制作记录复用项目数据保存脚本、分镜、镜头任务与素材；当前版本不将供应商视频 URL 复制到本地，URL 失效后可能无法回放。当前交付物是逐镜视频片段和剪辑方案，不代表已合并成单个 MP4。
+支持品牌营销视频与短剧 / 漫剧两条创作路线的本地内容创作平台。左侧提供「新对话」「创作流程」和「制作记录」入口：普通对话支持持续讨论、图片/视频/文件附件理解，并可生成图片、短视频或语音；涉及媒体生成时，助手会先说明生成内容并等待用户确认。创作流程选择内容类型并填写 brief，再按脚本、视觉设定、分镜、逐镜任务和视频片段逐步确认。工作流草稿可编辑，未经确认不会推进；已确认步骤也可回退修改或重新生成。上游修改后，后续内容与媒体素材会保留并标记为过期，重新确认后可逐步重生成；被覆盖的文本草稿可从历史版本恢复。确认镜头任务后，可逐镜生成/重试关键帧和视频片段，并查看 AI 剪辑方案、素材版本及供应商实际返回的任务/费用信息。制作记录复用项目数据保存脚本、分镜、镜头任务与素材，并可下载面向团队交接的人读制作交付包；当前版本不将供应商视频 URL 复制到本地，URL 失效后可能无法回放。当前交付物是逐镜视频片段和剪辑方案，不代表已合并成单个 MP4。
 
 ### 对话附件与最近对话
 
@@ -67,6 +67,12 @@ AGNES_API_KEY=你的Agnes_API_Key
 - `PUT /api/config/models`：仅 loopback 可调用；校验、持久化并热更新模型目录，API Key（若提交）单独写入本机凭据文件
 - `GET /api/config/models/{profile_id}/credential`：仅 loopback 可读，供本机配置编辑器回显 API Key
 - `GET /api/projects`、`POST /api/projects`：项目列表和创作流程项目创建
+- `GET/POST /api/series`、`GET/PUT /api/series/{series_id}`：剧集系列列表、创建与更新
+- `POST /api/series/{series_id}/assets`、`PUT /api/series/{series_id}/assets/{asset_id}`：创建或更新人物、场景与道具资产
+- `POST /api/series/{series_id}/continuity`、`PUT /api/series/{series_id}/continuity/{entry_id}`：新增或修改带来源记录的连续性台账条目
+- `GET /api/series/{series_id}/export`、`POST /api/series/import`：在本机同源工作台导出或导入完整系列副本（系列、资产、分集、聊天与引用媒体）
+- `GET /api/projects/{id}/export`、`POST /api/projects/import`：在本机同源工作台导出或导入单项目副本（不覆盖已有项目）
+- `GET /api/projects/{id}/delivery`：从本机同源工作台下载人读制作交付包（不用于恢复或导入）
 - `PUT /api/projects/{id}/title`：重命名对话或项目
 - `POST /api/projects/{id}/archive`：从最近对话移除；保留项目及其记录和媒体
 - `POST /api/chat/sessions`：创建无需 brief 的普通对话会话（首次发送消息后更新会话标题）
@@ -76,16 +82,37 @@ AGNES_API_KEY=你的Agnes_API_Key
 - `POST /api/projects/{id}/chat/stream`：发送文字和附件 ID，并通过 SSE 流式返回生成状态、文本增量和完成事件
 - `POST /api/projects/{id}/generate/{stage}`：生成当前阶段草稿（逐镜模式的视频阶段不支持整段生成）
 - `PUT /api/projects/{id}/content/{stage}`、`POST /api/projects/{id}/approve/{stage}`：修改和确认当前草稿
+- `GET /api/projects/{id}/content/{stage}/revisions`、`POST /api/projects/{id}/content/{stage}/revisions/{revision_id}/restore`：列出并恢复历史草稿；恢复时归档当前内容并将下游标为过期
+- `POST /api/projects/{id}/quality/{stage}`：运行确定性启发式检查，返回评分和问题提示（不是内容质量保证）
 - `POST /api/projects/{id}/rollback/{stage}`：回退到已确认的前序步骤；保留后续产物并标记为过期
 - `POST /api/projects/{id}/shots/{shot_id}/image`、`POST /api/projects/{id}/shots/{shot_id}/video`：按镜头生成/重试关键帧或视频片段；持久化视频任务入队后返回 HTTP 202，使用 `GET /api/projects/{id}` 查看状态
 - `POST /api/projects/{id}/shots/{shot_id}/video/cancel`：只取消仍在本地队列、尚未提交供应商的任务
 - `POST /api/projects/{id}/shots/{shot_id}/video/resume`：恢复超时或暂停任务的状态查询，不会重新提交生成
+- `GET /api/video-jobs`：查看本机需关注的视频队列/失败/中断任务和 Worker 状态
+- `GET /api/system/status`：查看应用/API 契约版本、功能标记和后台 Worker 状态
 - `GET /api/usage`：查看本机保存的调用、token 和供应商已报告费用
+- `GET /api/backup/export`：从本机同源工作台下载数据库与本地媒体备份
 - `GET /api/storage/cleanup/preview`、`POST /api/storage/cleanup`：预览并在明确确认后清理未引用的附件和媒体
 - `POST /api/audio/transcriptions`：multipart 音频转写（默认使用配置的转写 profile）
 - `GET /health`：健康检查
 
 OpenAPI 页面：<http://127.0.0.1:8000/docs>。
+
+## 剧集故事圣经与连续性台账
+
+左侧“剧集资产”可维护系列梗概、题材、世界设定、核心主题、季 / 主线弧光、主要人物弧光、计划结局、叙事基调、内容边界、视觉基调和备注，以及人物、场景和道具设定。系列与资产采用归档而非永久删除；已归档系列仍可查看已有分集，但不能继续新增分集。只有短剧 / 漫剧创作流程可以关联系列；创建分集时可指定集数，不指定则由 SQLite 事务原子分配该系列的下一个集数，并拒绝重复编号。
+
+连续性台账支持既定事实、已发生事件、关系变化、线索、未解线索和创作约束，并可标为已确认、待解决、已解决或已归档。台账可手动记录，也可引用分集中的已确认步骤；引用分集时，所选原文节选必须与该已确认步骤内容逐字匹配。修改记录会保留最多 12 个历史版本。系列页面可查看来源和修改历史，便于团队审阅而不是把模型生成结果直接当作既定事实。
+
+生成时，系列设定和最多 20 项未归档资产作为有界参考上下文传入工作流。连续性上下文最多包含 30 条、总计 8,000 字符：已确认条目作为故事事实，待解决条目作为待保留线索；已解决或归档条目不会继续传入，来源于当前或未来分集的条目也会排除。前序分集脚本只会选取编号最近的两集，且仅在脚本已确认后纳入（最多 4,000 字符）；未确认草稿不会泄漏到后续分集。系列设定、用户 brief 和剧本都作为参考资料，不覆盖系统规则或充当操作指令。`GET /api/system/status` 的 API 契约版本 3 会报告 `story_continuity_ledger` 功能标记。
+
+导入单项目副本时会复制系列设定和资产，但不会带入其他分集。系列详情页可导出整个系列 ZIP，也可在系列列表导入为新副本；系列导入会复制所有分集、对话、附件元数据和引用的本地媒体，重新分配记录 ID，不覆盖已有系列，也不包含凭据或用量记录。导入任务不会恢复供应商任务，在途任务会标记为中断。包大小上限为 512 MiB，导入仅允许本机同源请求。
+
+## 草稿修订、质量检查与服务诊断
+
+创作阶段的草稿修改和重新生成会保留历史版本。编辑器中的“载入编辑区”只把旧稿填入编辑器，保存后才替换当前内容；“恢复为当前版本”会先确认、归档现有内容，并将下游阶段标记为过期。质量检查为本地确定性启发式规则，提示占位文本、阻塞语言、重复行、分镜结构及目标时长等问题，不调用模型，也不替代人工审核。
+
+页面启动时读取 `/api/system/status`，比对 API 契约和所需功能；若出现旧服务、缺少路由或视频 Worker 未运行，会提示重启服务并硬刷新。此诊断仅报告本机服务状态，不提供身份认证或公网访问能力。用量对话框还可单独查看需关注的视频任务及其更新时间/错误。
 
 ## 用量、限额与存储清理
 
@@ -95,9 +122,43 @@ OpenAPI 页面：<http://127.0.0.1:8000/docs>。
 
 存储清理先展示候选附件和媒体文件，只有明确确认后才删除；删除前会再次检查引用关系，仍被项目或聊天使用的文件会保留。
 
+## 备份、恢复与导出
+
+可在工作台“用量与存储”中下载完整 ZIP 备份，也可用 CLI 导出 SQLite 数据库快照和本地 `media/` 文件。在线导出接口仅允许 loopback 客户端的同源请求。备份带 SHA-256 清单；不覆盖已有备份文件，也不包含 `model-credentials.json`、`.env` 或外部模型 Key。恢复会校验 ZIP 路径、清单、哈希和 SQLite 完整性，并且只允许写入一个尚不存在的新目录，不覆盖当前数据。
+
+```bash
+# 创建带 UTC 时间戳的备份，默认写入 backups/；数据库默认为 DATABASE_PATH 或 data/agent-platform.db
+.venv/bin/python -m app.backup create --keep 7
+
+# 只校验备份清单、SHA-256 和 SQLite 完整性，不改动应用数据
+.venv/bin/python -m app.backup verify backups/agent-platform-backup-<timestamp>.zip
+
+# 先预览将清理哪些旧备份；只有添加 --confirm 才会删除
+.venv/bin/python -m app.backup prune --directory backups --keep 7
+.venv/bin/python -m app.backup prune --directory backups --keep 7 --confirm
+
+# 恢复到新目录（默认解压上限 20 GiB）
+.venv/bin/python -m app.backup restore backups/agent-platform-backup-<timestamp>.zip --target data-restored
+
+# 需要时，以恢复后的数据库启动服务；媒体目录自动取其同级 media/
+DATABASE_PATH=data-restored/agent-platform.db .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+`create --keep N` 会在新备份成功后，仅轮换清理本工具生成的时间戳 ZIP；不带 `--keep` 时不会删除旧备份。`prune` 默认只预览。备份不包含模型凭据和模型目录自定义项；恢复后需重新配置 Key。大型媒体库可通过 `--max-restore-gb` 调整校验/恢复上限。数据库快照与媒体复制不是跨文件系统事务；若需确保二者处于同一时点，建议先停止服务，再使用 CLI 备份。定时频率和备份目录尚未替你设置；可在确定本机存储位置与时间后，将 `create --keep N` 配置到系统任务调度器。
+
+## 项目导入与导出
+
+在制作记录中打开一个项目，或在已有对话页面选择“导出项目副本”，可下载单项目 ZIP；在制作记录页选择“导入项目副本”可导入 ZIP。导入前会显示确认，现有项目不会被覆盖：项目、聊天记录、附件、关联系列资产和被引用的本地媒体都会复制并分配新 ID。系列只作为副本导入当前项目及其系列资产，不包含同系列其他分集；供应商凭据、全局用量记录和可恢复任务不会随包迁移，在途任务会被标记为中断，不会自动重新提交或轮询。
+
+制作记录详情的“下载制作交付包”用于人工/小团队交接，不同于项目副本和完整备份。包内有脚本、视觉设定、分镜、逐镜任务、制作状态摘要、README、清单及项目引用的本地媒体；远程供应商链接不会下载，任务 ID、聊天记录、用量和凭据不作为交付内容。交付包会明确标示步骤状态与“未合并成片”，不代表内容通过人工验收；仅允许 loopback 同源请求。
+
+项目包与完整备份不同，不包含其他项目，也不用于恢复数据库。ZIP 包含创作内容和可能敏感的附件/媒体，只导入可信文件。服务会校验成员路径、大小和 SHA-256，并限制包大小为 512 MiB；导入仅允许从本机同源工作台发起。导出的 PDF、HTML、SVG、文本、JSON 等非媒体文件在 `/media` 下以附件下载，不作为同源可执行页面内联展示。相同源检查是本机使用限制和 CSRF 缓解，不是身份认证。
+
 ## Skills
 
 在 `skills/<skill-id>/SKILL.md` 新增或修改 Markdown 即可；按创作类型与阶段加载，不执行文件中的代码。frontmatter 的 `tracks` 限定适用路线，`references` 显式内联同目录下的 Markdown 参考资料；缺少 `tracks` 的旧技能默认仅适用于营销路线。短剧 / 漫剧 Skills 是从经过审阅的上游 Markdown 中选择性适配，不调用上游脚本或媒体 adapter。第三方技能的来源、版本、适配和许可证记录见 [`docs/skill-sources.md`](docs/skill-sources.md)。
+
+本机 API 对带 `Origin` 的写入请求实施同源检查，并拒绝标记为 `cross-site` 的浏览器写入；未带浏览器来源头的本机 CLI/自动化请求仍可用。这是 CSRF 防护，不等同于登录认证或多人权限隔离；服务仍只适合绑定本机回环地址。
 
 ## 验证
 
@@ -106,4 +167,4 @@ OpenAPI 页面：<http://127.0.0.1:8000/docs>。
 node --check app/static/app.js
 ```
 
-自动化测试覆盖阶段确认、无凭据时不伪造结果、聊天附件传递与媒体生成二次确认、最近对话重命名/移除，以及视频任务提交/轮询/恢复。配置显示“已就绪”仅表示本地存在凭据，不代表供应商鉴权或生成成功。Agnes 视频服务此前返回过队列满（HTTP 503、`video_queue_full`），未返回可轮询的供应商任务 ID，因此实际任务完成流程尚未验证。真实媒体请求可能产生费用；自动化测试注入模拟 Provider，不调用真实供应商。
+自动化测试覆盖阶段确认、无凭据时不伪造结果、聊天附件传递与媒体生成二次确认、最近对话重命名/移除、视频任务提交/轮询/恢复/取消与用量限制、备份恢复、项目/系列副本迁移、草稿修订和启发式质量检查。配置显示“已就绪”仅表示本地存在凭据，不代表供应商鉴权或生成成功。Agnes 视频服务此前返回过队列满（HTTP 503、`video_queue_full`），未返回可轮询的供应商任务 ID，因此实际任务完成流程尚未验证。真实媒体请求可能产生费用；自动化测试注入模拟 Provider，不调用真实供应商。
