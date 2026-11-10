@@ -14,6 +14,7 @@ from app.providers.catalog import ModelProfile
 class ChatResult:
     text: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 class TextProvider(Protocol):
@@ -72,7 +73,15 @@ class OpenAICompatibleTextProvider:
                 "name": function.get("name", ""),
                 "arguments": arguments,
             })
-        return ChatResult(str(content), calls)
+        usage = data.get("usage") or {}
+        return ChatResult(
+            str(content),
+            calls,
+            {
+                "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                "output_tokens": int(usage.get("completion_tokens", 0) or 0),
+            },
+        )
 
     @staticmethod
     def _raise_for_response(response: httpx.Response) -> None:
@@ -262,7 +271,15 @@ class AnthropicTextProvider:
                 text_parts.append(block.text)
             elif getattr(block, "type", None) == "tool_use":
                 calls.append({"id": block.id, "name": block.name, "arguments": block.input})
-        return ChatResult("\n".join(text_parts).strip(), calls)
+        usage = getattr(response, "usage", None)
+        return ChatResult(
+            "\n".join(text_parts).strip(),
+            calls,
+            {
+                "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+                "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+            },
+        )
 
     def generate(self, *, system: str, user: str) -> str:
         return self._request([{"role": "system", "content": system}, {"role": "user", "content": user}]).text
@@ -302,7 +319,15 @@ class AnthropicTextProvider:
                 text_parts.append(block.text)
             elif getattr(block, "type", None) == "tool_use":
                 calls.append({"id": block.id, "name": block.name, "arguments": block.input})
-        return ChatResult("\n".join(text_parts).strip(), calls)
+        usage = getattr(response, "usage", None)
+        return ChatResult(
+            "\n".join(text_parts).strip(),
+            calls,
+            {
+                "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+                "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+            },
+        )
 
 
 def create_text_provider(profile: ModelProfile, api_key: str) -> TextProvider:

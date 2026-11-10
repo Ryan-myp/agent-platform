@@ -78,10 +78,22 @@ AGNES_API_KEY=你的Agnes_API_Key
 - `PUT /api/projects/{id}/content/{stage}`、`POST /api/projects/{id}/approve/{stage}`：修改和确认当前草稿
 - `POST /api/projects/{id}/rollback/{stage}`：回退到已确认的前序步骤；保留后续产物并标记为过期
 - `POST /api/projects/{id}/shots/{shot_id}/image`、`POST /api/projects/{id}/shots/{shot_id}/video`：按镜头生成/重试关键帧或视频片段；持久化视频任务入队后返回 HTTP 202，使用 `GET /api/projects/{id}` 查看状态
+- `POST /api/projects/{id}/shots/{shot_id}/video/cancel`：只取消仍在本地队列、尚未提交供应商的任务
+- `POST /api/projects/{id}/shots/{shot_id}/video/resume`：恢复超时或暂停任务的状态查询，不会重新提交生成
+- `GET /api/usage`：查看本机保存的调用、token 和供应商已报告费用
+- `GET /api/storage/cleanup/preview`、`POST /api/storage/cleanup`：预览并在明确确认后清理未引用的附件和媒体
 - `POST /api/audio/transcriptions`：multipart 音频转写（默认使用配置的转写 profile）
 - `GET /health`：健康检查
 
 OpenAPI 页面：<http://127.0.0.1:8000/docs>。
+
+## 用量、限额与存储清理
+
+`MEDIA_GENERATION_DAILY_LIMIT` 控制本地 UTC 日的媒体生成调用上限，默认 `0` 表示不限；限制和统计基于本地 SQLite 记录及当前单进程服务，不是供应商账单或多实例并发配额。`VIDEO_JOB_TIMEOUT_SECONDS` 默认 `300` 秒，最小 `60` 秒。可在 `.env` 中设置后重启服务。
+
+视频任务超时或连续查询失败后会保留供应商任务 ID；“恢复查询”只继续轮询，不会再次创建任务。任务尚在本地队列且未提交时才可取消；本地取消不等于供应商取消。若提交结果不确定，先到供应商侧核对任务，再明确确认是否重试。用量界面只汇总供应商明确返回的费用，未返回的费用保持未知，不做估算。
+
+存储清理先展示候选附件和媒体文件，只有明确确认后才删除；删除前会再次检查引用关系，仍被项目或聊天使用的文件会保留。
 
 ## Skills
 

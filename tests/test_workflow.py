@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from pathlib import Path
 
@@ -114,10 +114,10 @@ def test_home_page_avoids_stale_markup_and_loads_versioned_assets(tmp_path):
     assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate"
     assert 'id="open-records"' in response.text
     assert 'id="confirm-dialog"' in response.text
-    assert "/static/app.js?v=14" in response.text
-    assert "/static/style.css?v=15" in response.text
+    assert "/static/app.js?v=16" in response.text
+    assert "/static/style.css?v=16" in response.text
 
-    stylesheet = client.get("/static/style.css?v=15")
+    stylesheet = client.get("/static/style.css?v=16")
     assert stylesheet.status_code == 200
     assert "fonts.googleapis.com" not in stylesheet.text
 
@@ -1370,3 +1370,161 @@ def test_model_in_use_by_project_cannot_be_deleted(tmp_path):
     assert "agnes-text" in response.json()["detail"]
     assert catalog_path.read_text(encoding="utf-8") == initial_catalog
     assert client.get(f"/api/projects/{project['id']}").json()["model"] == "agnes-text"
+
+
+def test_settings_reports_invalid_numeric_environment_values(monkeypatch):
+    monkeypatch.setenv("MEDIA_GENERATION_DAILY_LIMIT", "not-a-number")
+    with pytest.raises(ValueError, match="MEDIA_GENERATION_DAILY_LIMIT must be an integer"):
+        Settings.from_env()
+
+
+def test_video_job_cancel_timeout_resume_and_usage(tmp_path):
+    class AsyncVideoProvider:
+        ready = True
+
+        def __init__(self):
+            self.submissions = 0
+            self.polls = []
+
+        def submit_video(self, *, project):
+            self.submissions += 1
+            return {"provider_task_id": f"provider-{self.submissions}", "task_id": f"task-{self.submissions}"}
+
+        def poll_video(self, *, provider_task_id):
+            self.polls.append(provider_task_id)
+            return {"status": "completed", "provider_status": "completed", "asset_url": "https://media.example/clip.mp4"}
+
+    provider = AsyncVideoProvider()
+    client = TestClient(
+        create_app(settings=replace(make_settings(tmp_path), video_job_timeout_seconds=60, media_generation_daily_limit=1), video_provider=provider),
+        client=("127.0.0.1", 54321),
+    )
+    project = new_project(client).json()
+    for stage in ("script", "prompt", "storyboard", "scenes"):
+        assert client.post(f"/api/projects/{project['id']}/generate/{stage}", json={}).status_code == 200
+        assert client.post(f"/api/projects/{project['id']}/approve/{stage}").status_code == 200
+
+    queued = client.post(f"/api/projects/{project['id']}/shots/S01/video")
+    assert queued.status_code == 202
+    cancelled = client.post(f"/api/projects/{project['id']}/shots/S01/video/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["workflow"]["video"]["shots"][0]["video"]["status"] == "cancelled"
+    assert provider.submissions == 0
+
+    queued = client.post(f"/api/projects/{project['id']}/shots/S02/video")
+    job_id = queued.json()["workflow"]["video"]["shots"][1]["video"]["job_id"]
+    worker = client.app.state.video_job_worker
+    assert worker.process_once() is True
+    job = client.app.state.workflow.store.get_video_job(job_id)
+    assert job["status"] == "polling"
+    assert job["provider_task_id"] == "provider-1"
+
+    past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    client.app.state.workflow.store.update_video_job(
+        job_id,
+        {"next_poll_at": datetime.now(timezone.utc).isoformat(), "deadline_at": past},
+    )
+    assert worker.process_once() is True
+    timed_out = client.get(f"/api/projects/{project['id']}").json()["workflow"]["video"]["shots"][1]["video"]
+    assert timed_out["status"] == "timed_out"
+    assert timed_out["task_id"] == "task-1"
+    assert provider.polls == []
+
+    resumed = client.post(f"/api/projects/{project['id']}/shots/S02/video/resume")
+    assert resumed.status_code == 200
+    assert worker.process_once() is True
+    ready = client.get(f"/api/projects/{project['id']}").json()["workflow"]["video"]["shots"][1]["video"]
+    assert ready["status"] == "ready"
+    assert provider.polls == ["provider-1"]
+    assert client.app.state.workflow.store.get_video_job(job_id)["status"] == "completed"
+    usage = client.get("/api/usage").json()
+    assert usage["media_calls_today"] == 1
+    matching_events = [item for item in usage["events"] if item["id"] == job_id]
+    assert len(matching_events) == 1
+    event = matching_events[0]
+    assert event["status"] == "completed"
+    assert event["provider_task_id"] == "provider-1"
+    blocked = client.post(f"/api/projects/{project['id']}/shots/S03/video")
+    assert blocked.status_code == 429
+    assert provider.submissions == 1
+
+
+def test_storage_cleanup_requires_confirmation_and_preserves_referenced_media(tmp_path):
+    client = make_client(tmp_path)
+    project = new_project(client).json()
+    orphan_upload = client.post(
+        f"/api/projects/{project['id']}/chat/attachments",
+        files={"files": ("orphan.txt", b"unused attachment", "text/plain")},
+    )
+    referenced_upload = client.post(
+        f"/api/projects/{project['id']}/chat/attachments",
+        files={"files": ("referenced.txt", b"keep this attachment", "text/plain")},
+    )
+    assert orphan_upload.status_code == referenced_upload.status_code == 201
+    orphan, referenced = orphan_upload.json()[0], referenced_upload.json()[0]
+    client.app.state.workflow.store.append_chat_message(project["id"], {
+        "id": "test-reference-message",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "role": "user",
+        "content": "请阅读这个附件",
+        "attachments": [referenced],
+    })
+
+    orphan_media_url = client.app.state.assets.save(b"unused media", ".bin")
+    orphan_media_key = orphan_media_url.rsplit("/", 1)[-1]
+    preview = client.get("/api/storage/cleanup/preview").json()
+    assert {item["id"] for item in preview["attachments"]} == {orphan["id"]}
+    assert orphan_media_key in {item["storage_key"] for item in preview["files"]}
+    assert referenced["id"] not in {item["id"] for item in preview["attachments"]}
+
+    denied = client.post("/api/storage/cleanup", json={
+        "attachment_ids": [orphan["id"]], "storage_keys": [orphan_media_key],
+    })
+    assert denied.status_code == 409
+
+    cleaned = client.post("/api/storage/cleanup", json={
+        "confirm": True,
+        "attachment_ids": [orphan["id"]],
+        "storage_keys": [orphan_media_key],
+    })
+    assert cleaned.status_code == 200
+    assert cleaned.json()["removed_attachments"] == 1
+    orphan_key = orphan["url"].rsplit("/", 1)[-1]
+    assert orphan_key in {item["storage_key"] for item in cleaned.json()["removed_files"]}
+    assert orphan_media_key in {item["storage_key"] for item in cleaned.json()["removed_files"]}
+    assert client.app.state.workflow.store.get_chat_attachment(orphan["id"], project["id"]) is None
+    assert client.app.state.workflow.store.get_chat_attachment(referenced["id"], project["id"]) is not None
+    assert (client.app.state.assets.directory / referenced["url"].rsplit("/", 1)[-1]).is_file()
+
+
+def test_storage_cleanup_rechecks_references_after_preview(tmp_path):
+    client = make_client(tmp_path)
+    project = new_project(client).json()
+    uploaded = client.post(
+        f"/api/projects/{project['id']}/chat/attachments",
+        files={"files": ("raced.txt", b"will become referenced", "text/plain")},
+    )
+    assert uploaded.status_code == 201
+    attachment = uploaded.json()[0]
+    media_url = client.app.state.assets.save(b"will become referenced", ".bin")
+    media_key = media_url.rsplit("/", 1)[-1]
+    preview = client.get("/api/storage/cleanup/preview").json()
+    assert attachment["id"] in {item["id"] for item in preview["attachments"]}
+    assert media_key in {item["storage_key"] for item in preview["files"]}
+
+    client.app.state.workflow.store.append_chat_message(project["id"], {
+        "id": "test-raced-reference-message",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "role": "user",
+        "content": f"请保留 /media/{media_key}",
+        "attachments": [attachment],
+    })
+    response = client.post("/api/storage/cleanup", json={
+        "confirm": True,
+        "attachment_ids": [attachment["id"]],
+        "storage_keys": [media_key],
+    })
+    assert response.status_code == 409
+    assert client.app.state.workflow.store.get_chat_attachment(attachment["id"], project["id"]) is not None
+    assert (client.app.state.assets.directory / attachment["url"].rsplit("/", 1)[-1]).is_file()
+    assert (client.app.state.assets.directory / media_key).is_file()

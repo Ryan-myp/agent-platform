@@ -1,5 +1,6 @@
 let videoJobPollTimer = null;
 let videoJobPollInFlight = false;
+let storageCleanupPreview = null;
 
 const state = {
   config: null,
@@ -24,6 +25,7 @@ const notice = document.querySelector("#notice");
 const projectList = document.querySelector("#project-list");
 const modelSelect = document.querySelector("#model-select");
 const modelsDialog = document.querySelector("#models-dialog");
+const usageDialog = document.querySelector("#usage-dialog");
 const confirmDialog = document.querySelector("#confirm-dialog");
 const renameDialog = document.querySelector("#rename-dialog");
 
@@ -545,6 +547,7 @@ function assetStatusLabel(asset = {}) {
   return ({
     pending: "待生成", queued: "后台排队中", submitting: "正在提交", generating: "生成中",
     ready: "已生成", failed: "生成失败", interrupted: "提交结果待核对", stale: "需重新生成",
+    cancelled: "本地队列已取消", timed_out: "监控超时（可恢复查询）", stalled: "查询暂停（可恢复）",
   })[asset.status] || "待生成";
 }
 
@@ -564,6 +567,8 @@ function renderVideoShot(shot) {
   const videoUrl = video.asset_url ? safeMediaUrl(video.asset_url) : "";
   const imageBusy = image.status === "generating";
   const videoBusy = ["queued", "submitting", "generating"].includes(video.status);
+  const videoNeedsRecovery = ["timed_out", "stalled"].includes(video.status);
+  const videoCanGenerate = !videoNeedsRecovery;
   const imageReady = Boolean(imageUrl);
   const videoReady = Boolean(videoUrl);
   const imageConfigured = Boolean(state.config?.image_provider_ready);
@@ -597,7 +602,10 @@ function renderVideoShot(shot) {
         ${video.job_id ? `<small class="shot-help">本地任务：${escapeHTML(video.job_id)}</small>` : ""}
         ${video.task_id ? `<small class="shot-help">供应商任务：${escapeHTML(video.task_id)}</small>` : ""}
         ${renderAssetVersions(video)}
-        <button class="button button-primary" type="button" data-shot-action="video" data-shot-id="${escapeHTML(shot.shot_id)}" ${videoBusy || !videoConfigured ? "disabled" : ""}>${videoBusy ? video.status === "queued" ? "后台排队中…" : video.status === "submitting" ? "正在提交…" : "视频生成中…" : video.status === "interrupted" ? "核对后重试" : videoReady ? "重新生成视频片段" : video.status === "failed" ? "重试视频片段" : "生成视频片段"}</button>
+        <button class="button button-primary" type="button" data-shot-action="video" data-shot-id="${escapeHTML(shot.shot_id)}" ${videoBusy || !videoConfigured || !videoCanGenerate ? "disabled" : ""}>${videoBusy ? video.status === "queued" ? "后台排队中…" : video.status === "submitting" ? "正在提交…" : "视频生成中…" : video.status === "interrupted" ? "核对后重试" : videoReady ? "重新生成视频片段" : video.status === "failed" ? "重试视频片段" : "生成视频片段"}</button>
+        ${video.status === "queued" ? `<button class="button button-subtle" type="button" data-shot-action="cancel-video" data-shot-id="${escapeHTML(shot.shot_id)}">取消本地排队</button>` : ""}
+        ${videoNeedsRecovery ? `<button class="button button-subtle" type="button" data-shot-action="resume-video" data-shot-id="${escapeHTML(shot.shot_id)}">继续查询供应商状态</button><small class="shot-help">仅恢复状态查询，不会重新提交生成任务。供应商任务 ID：${escapeHTML(video.task_id || "未知")}</small>` : ""}
+        ${["submitting", "generating"].includes(video.status) ? '<small class="shot-help">供应商可能已受理任务；当前不支持将此状态显示为“已取消”。</small>' : ""}
         ${!videoConfigured ? '<small class="shot-help">请先配置默认视频模型及 Key。</small>' : ""}
       </section>
     </div>
@@ -779,7 +787,15 @@ function renderProject() {
   document.querySelector("#regenerate-stage")?.addEventListener("click", requestGenerateStage);
   document.querySelector("#rollback-stage")?.addEventListener("click", rollbackStage);
   workspace.querySelectorAll("[data-shot-action]").forEach((button) => {
-    button.addEventListener("click", () => generateShotAsset(button.dataset.shotId, button.dataset.shotAction));
+    button.addEventListener("click", () => {
+      if (button.dataset.shotAction === "cancel-video") {
+        manageVideoJob(button.dataset.shotId, "cancel");
+      } else if (button.dataset.shotAction === "resume-video") {
+        manageVideoJob(button.dataset.shotId, "resume");
+      } else {
+        generateShotAsset(button.dataset.shotId, button.dataset.shotAction);
+      }
+    });
   });
   document.querySelector("#approve-stage")?.addEventListener("click", approveStage);
   document.querySelector("#save-content")?.addEventListener("click", saveContent);
@@ -1206,6 +1222,43 @@ async function generateStage() {
   } catch (error) {
     showNotice(error.message, true);
     renderProject();
+  }
+}
+
+async function manageVideoJob(shotId, action) {
+  const projectId = state.project.id;
+  if (action === "cancel") {
+    const confirmed = await confirmInApp({
+      title: "取消本地排队任务",
+      message: "只会取消尚未提交给供应商的本地排队任务。正在提交或供应商已受理的任务不能在这里被视为已取消。",
+      confirmLabel: "取消排队任务",
+      cancelLabel: "继续等待",
+    });
+    if (!confirmed) return;
+  }
+  const endpoint = action === "cancel" ? "cancel" : "resume";
+  const button = [...workspace.querySelectorAll("[data-shot-action]")]
+    .find((item) => item.dataset.shotId === shotId && item.dataset.shotAction === `${endpoint}-video`);
+  if (button) button.disabled = true;
+  showNotice(action === "cancel" ? `正在取消 ${shotId} 的本地排队任务…` : `正在恢复 ${shotId} 的供应商状态查询…`, false);
+  try {
+    state.project = await api(
+      `/api/projects/${encodeURIComponent(projectId)}/shots/${encodeURIComponent(shotId)}/video/${endpoint}`,
+      { method: "POST" },
+    );
+    await refreshProjects();
+    state.viewStage = "video";
+    showNotice(action === "cancel" ? "本地排队任务已取消，未提交给供应商。" : "已恢复状态查询；不会重新提交生成任务。", false);
+    renderProject();
+  } catch (error) {
+    showNotice(error.message, true);
+    try {
+      state.project = await api(`/api/projects/${encodeURIComponent(projectId)}`);
+      state.viewStage = "video";
+      renderProject();
+    } catch {
+      if (button) button.disabled = false;
+    }
   }
 }
 
@@ -1930,6 +1983,132 @@ function showModelSettings() {
   document.querySelector("#add-model").focus();
 }
 
+function formatStorageBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderUsageSummary(summary) {
+  const host = document.querySelector("#usage-summary");
+  if (!host) return;
+  const limit = summary.daily_media_limit
+    ? `${summary.media_calls_today} / ${summary.daily_media_limit}`
+    : `${summary.media_calls_today} / 不限`;
+  const remaining = summary.media_calls_remaining_today == null
+    ? "不设每日上限"
+    : `今日剩余 ${summary.media_calls_remaining_today} 次`;
+  const rows = summary.totals || [];
+  host.innerHTML = `
+    <div class="usage-metrics">
+      <div><span>今日媒体调用</span><strong>${escapeHTML(limit)}</strong><small>${escapeHTML(remaining)}</small></div>
+      <div><span>本地保留记录</span><strong>${escapeHTML(summary.events?.length || 0)}</strong><small>最多展示最近 100 条</small></div>
+    </div>
+    ${rows.length ? `<div class="usage-table">${rows.map((row) => `
+      <article class="usage-row">
+        <div><strong>${escapeHTML(row.operation)}</strong><small>${escapeHTML(row.modality)} · ${escapeHTML(row.model_id)}</small></div>
+        <div><strong>${escapeHTML(row.calls)} 次</strong><small>成功 ${escapeHTML(row.succeeded)} · 失败 ${escapeHTML(row.failed)}</small></div>
+        <div><strong>${escapeHTML(row.input_tokens + row.output_tokens)} tokens</strong><small>已知费用 ${escapeHTML(Number(row.known_cost || 0).toFixed(4))}（${escapeHTML(row.cost_events)} 条供应商金额）</small></div>
+      </article>`).join("")}</div>` : '<p class="usage-empty">尚无调用记录。</p>'}
+  `;
+}
+
+async function refreshUsageSummary() {
+  const host = document.querySelector("#usage-summary");
+  if (host) host.textContent = "正在读取本地用量…";
+  try {
+    renderUsageSummary(await api("/api/usage"));
+  } catch (error) {
+    if (host) host.textContent = error.message;
+  }
+}
+
+function selectedCleanupItems() {
+  const host = document.querySelector("#storage-cleanup-list");
+  if (!host) return { attachment_ids: [], storage_keys: [] };
+  return {
+    attachment_ids: [...host.querySelectorAll("[data-cleanup-attachment]:checked")].map((item) => item.dataset.cleanupAttachment),
+    storage_keys: [...host.querySelectorAll("[data-cleanup-file]:checked")].map((item) => item.dataset.cleanupFile),
+  };
+}
+
+function updateCleanupButton() {
+  const button = document.querySelector("#confirm-storage-cleanup");
+  if (!button) return;
+  const selected = selectedCleanupItems();
+  button.disabled = selected.attachment_ids.length + selected.storage_keys.length === 0;
+}
+
+function renderStorageCleanup(preview) {
+  storageCleanupPreview = preview;
+  const host = document.querySelector("#storage-cleanup-list");
+  if (!host) return;
+  const attachments = preview.attachments || [];
+  const files = preview.files || [];
+  if (!attachments.length && !files.length) {
+    host.innerHTML = '<p class="usage-empty">没有发现可清理的未引用项目。</p>';
+    updateCleanupButton();
+    return;
+  }
+  host.innerHTML = `
+    <p class="cleanup-total">${attachments.length} 个未引用附件记录 · ${files.length} 个未引用媒体文件 · ${formatStorageBytes(preview.total_bytes || 0)}</p>
+    <div class="cleanup-candidates">
+      ${attachments.map((item) => `<label class="cleanup-candidate"><input type="checkbox" data-cleanup-attachment="${escapeHTML(item.id)}" checked /><span><strong>${escapeHTML(item.filename)}</strong><small>附件记录 · ${formatStorageBytes(item.size)} · ${escapeHTML(item.project_id)}</small></span></label>`).join("")}
+      ${files.map((item) => `<label class="cleanup-candidate"><input type="checkbox" data-cleanup-file="${escapeHTML(item.storage_key)}" checked /><span><strong>${escapeHTML(item.storage_key)}</strong><small>未引用媒体 · ${formatStorageBytes(item.size)}</small></span></label>`).join("")}
+    </div>`;
+  updateCleanupButton();
+}
+
+async function previewStorageCleanup() {
+  const host = document.querySelector("#storage-cleanup-list");
+  const status = document.querySelector("#storage-cleanup-status");
+  const previewButton = document.querySelector("#preview-storage-cleanup");
+  if (previewButton) previewButton.disabled = true;
+  if (host) host.textContent = "正在检查本地引用…";
+  if (status) status.textContent = "";
+  try {
+    renderStorageCleanup(await api("/api/storage/cleanup/preview"));
+  } catch (error) {
+    if (host) host.textContent = error.message;
+  } finally {
+    if (previewButton) previewButton.disabled = false;
+  }
+}
+
+async function confirmStorageCleanup() {
+  const selected = selectedCleanupItems();
+  const count = selected.attachment_ids.length + selected.storage_keys.length;
+  if (!count) return;
+  const confirmed = await confirmInApp({
+    title: "删除未引用的本地文件？",
+    message: `将删除 ${selected.attachment_ids.length} 条未引用附件记录和 ${selected.storage_keys.length} 个未引用媒体文件。系统会在删除前再次检查引用；此操作无法撤销。`,
+    confirmLabel: "确认删除",
+    cancelLabel: "保留文件",
+  });
+  if (!confirmed) return;
+  const button = document.querySelector("#confirm-storage-cleanup");
+  if (button) button.disabled = true;
+  const status = document.querySelector("#storage-cleanup-status");
+  if (status) status.textContent = "正在再次检查引用并清理…";
+  try {
+    const result = await api("/api/storage/cleanup", {
+      method: "POST",
+      body: JSON.stringify({ confirm: true, ...selected }),
+    });
+    await previewStorageCleanup();
+    if (status) status.textContent = `已删除 ${result.removed_attachments} 条附件记录、${result.removed_files.length} 个媒体文件（${formatStorageBytes(result.removed_bytes)}）。`;
+  } catch (error) {
+    if (status) status.textContent = error.message;
+    updateCleanupButton();
+  }
+}
+
+async function showUsageSettings() {
+  if (!usageDialog.open) usageDialog.showModal();
+  await Promise.all([refreshUsageSummary(), previewStorageCleanup()]);
+}
+
 async function initialize() {
   try {
     [state.config, state.projects, state.skills] = await Promise.all([
@@ -1948,6 +2127,10 @@ async function initialize() {
     modelSelect.addEventListener("change", updateModel);
     document.querySelector("#view-toggle").addEventListener("click", toggleProjectView);
     document.querySelector("#open-models").addEventListener("click", showModelSettings);
+    document.querySelector("#open-usage").addEventListener("click", showUsageSettings);
+    document.querySelector("#preview-storage-cleanup").addEventListener("click", previewStorageCleanup);
+    document.querySelector("#confirm-storage-cleanup").addEventListener("click", confirmStorageCleanup);
+    document.querySelector("#storage-cleanup-list").addEventListener("change", updateCleanupButton);
     document.querySelector("#add-model").addEventListener("click", () => openModelEditor());
     document.querySelector("#model-profiles").addEventListener("click", (event) => {
       const edit = event.target.closest("[data-model-edit]");
@@ -1973,6 +2156,7 @@ async function initialize() {
       }
     });
     document.querySelector("#close-models").addEventListener("click", () => modelsDialog.close());
+    document.querySelector("#close-usage").addEventListener("click", () => usageDialog.close());
     document.querySelector("#rename-form").addEventListener("submit", saveProjectTitle);
     document.querySelector("#rename-cancel").addEventListener("click", () => renameDialog.close());
     document.querySelector("#open-records")?.addEventListener("click", showProductionRecords);

@@ -309,6 +309,74 @@ class ChatAttachmentService:
             raise ChatAttachmentError("视频中没有可供 AI 分析的画面。")
         return frames, duration, truncated
 
+    def preview_storage_cleanup(self) -> dict[str, Any]:
+        unreferenced_attachments = self.store.list_unreferenced_chat_attachments()
+        references = self.store.media_storage_references()
+        root = self.assets.directory.resolve()
+        files = []
+        for path in root.iterdir():
+            if path.is_symlink() or not path.is_file():
+                continue
+            if path.name in references:
+                continue
+            files.append({"storage_key": path.name, "size": path.stat().st_size})
+        files.sort(key=lambda item: item["storage_key"])
+        attachments = [
+            {
+                "id": str(item["id"]),
+                "project_id": str(item.get("project_id", "")),
+                "filename": str(item.get("filename", "附件")),
+                "storage_key": str(item.get("storage_key", "")),
+                "size": int(item.get("size", 0)),
+            }
+            for item in unreferenced_attachments
+        ]
+        return {
+            "attachments": attachments,
+            "files": files,
+            "total_bytes": sum(item["size"] for item in files) + sum(item["size"] for item in attachments),
+        }
+
+    def confirm_storage_cleanup(
+        self, *, attachment_ids: list[str], storage_keys: list[str]
+    ) -> dict[str, Any]:
+        if len(attachment_ids) > 1000 or len(storage_keys) > 1000:
+            raise ChatAttachmentError("一次最多清理 1000 个本地项目，请分批操作。")
+        if len(set(attachment_ids)) != len(attachment_ids) or len(set(storage_keys)) != len(storage_keys):
+            raise ChatAttachmentError("清理列表中存在重复项目，请刷新预览。")
+        preview = self.preview_storage_cleanup()
+        eligible_attachment_ids = {item["id"] for item in preview["attachments"]}
+        if not set(attachment_ids).issubset(eligible_attachment_ids):
+            raise ChatAttachmentError("附件引用状态已变化，请刷新清理预览后再确认。")
+        eligible_storage_keys = {item["storage_key"] for item in preview["files"]}
+        if not set(storage_keys).issubset(eligible_storage_keys):
+            raise ChatAttachmentError("媒体引用状态已变化，请刷新清理预览后再确认。")
+
+        removed_attachments = self.store.delete_unreferenced_chat_attachments(
+            attachment_ids=set(attachment_ids)
+        ) if attachment_ids else []
+        keys_to_remove = set(storage_keys)
+        keys_to_remove.update(
+            str(item.get("storage_key", "")) for item in removed_attachments if item.get("storage_key")
+        )
+        still_referenced = self.store.media_storage_references()
+        removed_files = []
+        for storage_key in sorted(keys_to_remove):
+            if storage_key in still_referenced or Path(storage_key).name != storage_key:
+                continue
+            root = self.assets.directory.resolve()
+            path = root / storage_key
+            if path.parent.resolve() != root or path.is_symlink() or not path.is_file():
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            removed_files.append({"storage_key": storage_key, "size": size})
+        return {
+            "removed_attachments": len(removed_attachments),
+            "removed_files": removed_files,
+            "removed_bytes": sum(item["size"] for item in removed_files),
+        }
+
     def provider_attachments(self, message: dict[str, Any]) -> list[dict[str, Any]]:
         result = []
         for summary in message.get("attachments", []):

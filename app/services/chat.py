@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 from uuid import uuid4
@@ -23,6 +24,7 @@ from app.services.attachments import (
     ChatAttachmentService,
 )
 from app.store import ProjectStore
+from app.services.usage import UsageLimitExceeded, UsageService
 
 
 TOOLS = [
@@ -91,11 +93,13 @@ class ChatService:
         settings: Settings,
         assets: AssetStore,
         attachment_service: ChatAttachmentService | None = None,
+        usage: UsageService | None = None,
     ):
         self.store = store
         self.settings = settings
         self.assets = assets
         self.attachment_service = attachment_service or ChatAttachmentService(store, assets)
+        self.usage = usage or UsageService(store, settings.media_generation_daily_limit)
 
     def history(self, project_id: str, limit: int = 50) -> list[dict[str, Any]]:
         if not self.store.get(project_id):
@@ -176,7 +180,7 @@ class ChatService:
         else:
             if on_event:
                 on_event({"type": "status", "message": f"正在连接 {profile.name}…"})
-            result = self._request_chat(provider, messages, on_event)
+            result = self._request_chat_with_usage(project_id, selected_id, provider, messages, on_event)
 
         generated_attachments: list[dict[str, Any]] = []
         execute_authorized_action = bool(authorized_action)
@@ -230,7 +234,9 @@ class ChatService:
                     }
                     on_event({"type": "status", "message": labels.get(call["name"], "正在处理媒体任务…")})
                 try:
-                    output = self._execute_tool(call["name"], call.get("arguments", {}), project)
+                    output = self._execute_tool_with_usage(
+                        project_id, call["name"], call.get("arguments", {}), project
+                    )
                     generated_attachments.extend(output.get("attachments", []))
                     tool_content = output.get("message", "已完成。")
                 except Exception as error:
@@ -250,7 +256,7 @@ class ChatService:
                     "internal": True,
                 })
             execute_authorized_action = False
-            result = self._request_chat(provider, messages, on_event)
+            result = self._request_chat_with_usage(project_id, selected_id, provider, messages, on_event)
         self._save(project_id, {
             "role": "assistant",
             "content": result.text or "已处理。",
@@ -292,6 +298,41 @@ class ChatService:
         ])
         return "\n".join(lines)
 
+    def _request_chat_with_usage(
+        self,
+        project_id: str,
+        model_id: str,
+        provider: TextProvider,
+        messages: list[dict[str, Any]],
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> ChatResult:
+        started = time.perf_counter()
+        try:
+            result = self._request_chat(provider, messages, on_event)
+        except Exception:
+            self.usage.record(
+                project_id=project_id,
+                modality="text",
+                model_id=model_id,
+                operation="chat",
+                status="failed",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error_category="provider_error",
+            )
+            raise
+        result_usage = getattr(result, "usage", {}) or {}
+        self.usage.record(
+            project_id=project_id,
+            modality="text",
+            model_id=model_id,
+            operation="chat",
+            status="succeeded",
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            input_tokens=result_usage.get("input_tokens"),
+            output_tokens=result_usage.get("output_tokens"),
+        )
+        return result
+
     @staticmethod
     def _request_chat(
         provider: TextProvider,
@@ -310,6 +351,64 @@ class ChatService:
         except Exception as error:
             raise RuntimeError(f"文本模型请求失败：{error}") from error
 
+    def _execute_tool_with_usage(
+        self, project_id: str, name: str, arguments: dict[str, Any], project: dict[str, Any]
+    ) -> dict[str, Any]:
+        modality = {
+            "generate_image": "image",
+            "generate_video": "video",
+            "generate_speech": "audio",
+        }.get(name)
+        if modality is None:
+            return self._execute_tool(name, arguments, project)
+        profile = self._default_profile(modality)
+        started = time.perf_counter()
+        try:
+            event = self.usage.begin_media_call(
+                project_id=project_id,
+                modality=modality,
+                model_id=profile.id,
+                operation=f"chat.{name}",
+            )
+        except UsageLimitExceeded:
+            self.usage.record(
+                project_id=project_id,
+                modality=modality,
+                model_id=profile.id,
+                operation=f"chat.{name}",
+                status="blocked_limit",
+                error_category="daily_limit",
+            )
+            raise
+        try:
+            output = self._execute_tool(name, arguments, project)
+        except Exception:
+            self.usage.record(
+                project_id=project_id,
+                modality=modality,
+                model_id=profile.id,
+                operation=f"chat.{name}",
+                status="failed",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error_category="provider_error",
+                event_id=event["id"],
+                created_at=event["created_at"],
+            )
+            raise
+        self.usage.record(
+            project_id=project_id,
+            modality=modality,
+            model_id=profile.id,
+            operation=f"chat.{name}",
+            status="succeeded",
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            cost=output.get("cost"),
+            provider_task_id=output.get("provider_task_id"),
+            event_id=event["id"],
+            created_at=event["created_at"],
+        )
+        return output
+
     def _execute_tool(self, name: str, arguments: dict[str, Any], project: dict[str, Any]) -> dict[str, Any]:
         if name == "generate_image":
             profile = self._default_profile("image")
@@ -321,6 +420,8 @@ class ChatService:
             return {
                 "message": "图片已生成。",
                 "attachments": [{"type": "image", "url": result["asset_url"], "model": profile.name}],
+                "cost": result.get("cost"),
+                "provider_task_id": result.get("task_id"),
             }
         if name == "generate_video":
             profile = self._default_profile("video")
@@ -334,6 +435,8 @@ class ChatService:
             return {
                 "message": "视频已生成。",
                 "attachments": [{"type": "video", "url": result["asset_url"], "model": profile.name}],
+                "cost": result.get("cost"),
+                "provider_task_id": result.get("task_id"),
             }
         if name == "generate_speech":
             profile = self._default_profile("audio")
@@ -345,6 +448,8 @@ class ChatService:
             return {
                 "message": "语音已生成。",
                 "attachments": [{"type": "audio", "url": result["asset_url"], "model": profile.name}],
+                "cost": result.get("cost"),
+                "provider_task_id": result.get("task_id"),
             }
         raise MediaProviderError(f"未知的工具：{name}")
 

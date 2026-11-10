@@ -62,3 +62,9 @@ class ChatRequest(BaseModel):
     message: str = Field(default="", max_length=10000)
     model: str | None = None
     attachment_ids: list[str] = Field(default_factory=list, max_length=8)
+
+
+class StorageCleanupRequest(BaseModel):
+    confirm: bool = False
+    attachment_ids: list[str] = Field(default_factory=list, max_length=1000)
+    storage_keys: list[str] = Field(default_factory=list, max_length=1000)

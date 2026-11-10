@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -30,6 +31,7 @@ from app.services.production import (
     normalize_scene_plan,
     serialize_scene_plan,
 )
+from app.services.usage import UsageLimitExceeded, UsageService
 
 
 class WorkflowError(Exception):
@@ -63,6 +65,7 @@ class WorkflowService:
         video_provider: VideoProvider | None = None,
         image_provider: ImageProvider | None = None,
         assets: AssetStore | None = None,
+        usage: UsageService | None = None,
     ):
         self.store = store
         self.settings = settings
@@ -70,6 +73,7 @@ class WorkflowService:
         self.video_provider_override = video_provider
         self.image_provider_override = image_provider
         self.assets = assets or AssetStore(settings.database_path.parent / "media")
+        self.usage = usage or UsageService(store, settings.media_generation_daily_limit)
         self._media_jobs_lock = threading.Lock()
         self._active_media_jobs: set[tuple[str, str, str]] = set()
         self.video_job_worker = None
@@ -307,13 +311,41 @@ class WorkflowService:
             if video_workflow.get("shots"):
                 raise WorkflowError("当前项目已启用逐镜生成；请在镜头卡片中单独生成或重试视频片段。", 409)
             provider = self._get_video_provider()
+            profile_id = self.settings.model_catalog.defaults.get("video") or "injected-provider"
+            started = time.perf_counter()
+            try:
+                event = self.usage.begin_media_call(
+                    project_id=project_id, modality="video", model_id=profile_id,
+                    operation="workflow.video",
+                )
+            except UsageLimitExceeded as exc:
+                raise WorkflowError(str(exc), 429) from exc
             try:
                 result = provider.generate_video(project=project)
             except (MediaProviderError, RuntimeError) as exc:
+                self.usage.record(
+                    project_id=project_id, modality="video", model_id=profile_id,
+                    operation="workflow.video", status="failed",
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    error_category="provider_error", event_id=event["id"], created_at=event["created_at"],
+                )
                 raise WorkflowError(str(exc), 502) from exc
             asset_url = result.get("asset_url")
             if not asset_url:
+                self.usage.record(
+                    project_id=project_id, modality="video", model_id=profile_id,
+                    operation="workflow.video", status="failed",
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    error_category="invalid_provider_response", event_id=event["id"], created_at=event["created_at"],
+                )
                 raise WorkflowError("视频服务未返回成片地址。", 502)
+            self.usage.record(
+                project_id=project_id, modality="video", model_id=profile_id,
+                operation="workflow.video", status="succeeded",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                cost=result.get("cost") if isinstance(result.get("cost"), (int, float)) else None,
+                provider_task_id=result.get("task_id"), event_id=event["id"], created_at=event["created_at"],
+            )
             project["workflow"][stage] = {
                 "status": "ready",
                 "content": result.get("summary", "成片已生成"),
@@ -373,15 +405,33 @@ class WorkflowService:
             f"已确认的前序内容：{previous or '无'}\n"
             "请根据这些信息完成当前步骤。若 brief 缺少必要信息，请在结果中标出待确认项，不要自行杜撰。"
         )
+        started = time.perf_counter()
         try:
             content = provider.generate(system=system, user=user)
             scene_plan = normalize_scene_plan(content) if stage == "scenes" else None
             if scene_plan is not None:
                 content = serialize_scene_plan(scene_plan)
         except ScenePlanError as exc:
+            self.usage.record(
+                project_id=project_id, modality="text", model_id=selected_model,
+                operation=f"workflow.{stage}", status="failed",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error_category="invalid_model_output",
+            )
             raise WorkflowError(str(exc), 422) from exc
         except Exception as exc:
+            self.usage.record(
+                project_id=project_id, modality="text", model_id=selected_model,
+                operation=f"workflow.{stage}", status="failed",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error_category="provider_error",
+            )
             raise WorkflowError(f"文本模型调用失败：{exc}", 502) from exc
+        self.usage.record(
+            project_id=project_id, modality="text", model_id=selected_model,
+            operation=f"workflow.{stage}", status="succeeded",
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
         project["model"] = selected_model
         previous_item = project["workflow"][stage]
         self._archive_stage_content(previous_item, "重新生成前的草稿")
@@ -460,6 +510,19 @@ class WorkflowService:
             "error": None,
         })
         project["updated_at"] = now_iso()
+        started = time.perf_counter()
+        try:
+            event = self.usage.begin_media_call(
+                project_id=project_id,
+                modality=kind,
+                model_id=profile_id or "injected-provider",
+                operation=f"workflow.shot_{kind}",
+            )
+        except UsageLimitExceeded as exc:
+            asset.update({"status": "failed", "completed_at": now_iso(), "error": str(exc)})
+            project["updated_at"] = now_iso()
+            self.store.save(project)
+            raise WorkflowError(str(exc), 429) from exc
         try:
             self.store.save(project)
             if kind == "image":
@@ -495,6 +558,18 @@ class WorkflowService:
                 "task_id": task_id,
                 "cost": cost,
             }
+            self.usage.record(
+                project_id=project_id,
+                modality=kind,
+                model_id=profile_id or "injected-provider",
+                operation=f"workflow.shot_{kind}",
+                status="succeeded",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                cost=cost if isinstance(cost, (int, float)) else None,
+                provider_task_id=task_id,
+                event_id=event["id"],
+                created_at=event["created_at"],
+            )
             asset.setdefault("versions", []).append(version)
             asset.update({
                 "status": "ready",
@@ -507,6 +582,17 @@ class WorkflowService:
             asset.pop("stale_status", None)
             asset.pop("stale_reason", None)
         except Exception as exc:
+            self.usage.record(
+                project_id=project_id,
+                modality=kind,
+                model_id=profile_id or "injected-provider",
+                operation=f"workflow.shot_{kind}",
+                status="failed",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error_category="provider_error",
+                event_id=event["id"],
+                created_at=event["created_at"],
+            )
             asset.update({"status": "failed", "completed_at": now_iso(), "error": str(exc)[:1000]})
             project["updated_at"] = now_iso()
             self.store.save(project)
@@ -584,6 +670,30 @@ class WorkflowService:
         else:
             video["status"] = "pending"
 
+    def _record_video_job_usage(self, job: dict, status: str, *, cost: float | None = None) -> None:
+        created_at = job.get("created_at") or now_iso()
+        try:
+            started_at = datetime.fromisoformat(created_at)
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            duration_ms = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000))
+        except (TypeError, ValueError):
+            duration_ms = None
+        usage_status = "uncertain" if status == "interrupted" else status
+        self.usage.record(
+            project_id=job.get("project_id"),
+            modality="video",
+            model_id=job.get("model"),
+            operation="workflow.shot_video",
+            status=usage_status,
+            duration_ms=duration_ms,
+            cost=cost,
+            error_category=job.get("error_category"),
+            provider_task_id=job.get("provider_task_id"),
+            event_id=job.get("id"),
+            created_at=created_at,
+        )
+
     def _update_video_job(
         self,
         job: dict,
@@ -605,32 +715,65 @@ class WorkflowService:
                 self._refresh_video_stage_status(project)
                 project["updated_at"] = now_iso()
                 should_save_project = True
-        return self.store.update_video_job(
+        updated = self.store.update_video_job(
             job["id"], updates, project=project if should_save_project else None
         )
+        self._record_video_job_usage(updated, updated["status"])
+        return updated
 
-    def _fail_video_job(self, job: dict, message: str) -> None:
+    @staticmethod
+    def _video_error_category(message: str) -> str:
+        lowered = str(message).lower()
+        if "video_queue_full" in lowered or "队列已满" in lowered:
+            return "queue_full"
+        if "401" in lowered or "403" in lowered or "api key" in lowered or "鉴权" in lowered:
+            return "authentication"
+        if "429" in lowered or "rate limit" in lowered or "限流" in lowered:
+            return "rate_limit"
+        if "400" in lowered or "invalid" in lowered or "参数" in lowered:
+            return "invalid_request"
+        return "provider_error"
+
+    def _fail_video_job(self, job: dict, message: str, category: str | None = None) -> None:
         error = str(message)[:1000]
+        error_category = category or self._video_error_category(error)
         self._update_video_job(
             job,
-            {"status": "failed", "error": error, "next_poll_at": None},
-            asset_updates={"status": "failed", "completed_at": now_iso(), "error": error},
+            {"status": "failed", "error": error, "error_category": error_category, "next_poll_at": None},
+            asset_updates={"status": "failed", "completed_at": now_iso(), "error": error, "error_category": error_category},
         )
 
     def _mark_video_job_interrupted(self, job: dict, message: str) -> None:
         error = str(message)[:1000]
         self._update_video_job(
             job,
-            {"status": "interrupted", "error": error, "next_poll_at": None},
+            {"status": "interrupted", "error": error, "error_category": "submission_uncertain", "next_poll_at": None},
             asset_updates={
                 "status": "interrupted",
                 "completed_at": now_iso(),
                 "error": error,
+                "error_category": "submission_uncertain",
             },
+        )
+
+    def _timeout_video_job(self, job: dict) -> None:
+        message = "本地轮询超过监控期限；供应商任务可能仍在运行。请核对供应商任务，或恢复查询；本地不会重复提交。"
+        self._update_video_job(
+            job,
+            {"status": "timed_out", "error": message, "error_category": "provider_timeout", "timed_out_at": now_iso(), "next_poll_at": None},
+            asset_updates={"status": "timed_out", "completed_at": now_iso(), "error": message, "error_category": "provider_timeout", "provider_status": "超过本地监控期限，供应商任务仍可能运行"},
         )
 
     def _defer_video_job_poll(self, job: dict, message: str) -> None:
         failures = int(job.get("poll_failures", 0)) + 1
+        if failures >= 5:
+            error = f"已连续 {failures} 次查询失败，自动轮询已暂停。请核对供应商任务，或手动恢复查询。"
+            self._update_video_job(
+                job,
+                {"status": "stalled", "poll_failures": failures, "last_poll_error": str(message)[:1000], "error": error, "error_category": "polling_error", "stalled_at": now_iso(), "next_poll_at": None},
+                asset_updates={"status": "stalled", "completed_at": now_iso(), "error": error, "error_category": "polling_error", "provider_status": "多次查询失败，自动轮询已暂停"},
+            )
+            return
         delay_seconds = min(5 * (2 ** min(failures - 1, 4)), 60)
         next_poll = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat()
         self._update_video_job(
@@ -672,7 +815,9 @@ class WorkflowService:
             )
             return
         task_id = str(task.get("task_id") or provider_task_id)
-        next_poll = (datetime.now(timezone.utc) + timedelta(seconds=3)).isoformat()
+        submitted_at = datetime.now(timezone.utc)
+        next_poll = (submitted_at + timedelta(seconds=3)).isoformat()
+        deadline_at = (submitted_at + timedelta(seconds=self.settings.video_job_timeout_seconds)).isoformat()
         self._update_video_job(
             job,
             {
@@ -680,6 +825,8 @@ class WorkflowService:
                 "provider_task_id": str(provider_task_id),
                 "task_id": task_id,
                 "provider_status": "submitted",
+                "submitted_at": submitted_at.isoformat(),
+                "deadline_at": deadline_at,
                 "poll_failures": 0,
                 "next_poll_at": next_poll,
                 "error": None,
@@ -693,6 +840,17 @@ class WorkflowService:
         )
 
     def _poll_video_job(self, job: dict) -> None:
+        deadline_at = job.get("deadline_at")
+        if deadline_at:
+            try:
+                deadline = datetime.fromisoformat(deadline_at)
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) >= deadline:
+                    self._timeout_video_job(job)
+                    return
+            except ValueError:
+                pass
         provider_task_id = job.get("provider_task_id")
         if not provider_task_id:
             self._mark_video_job_interrupted(
@@ -733,6 +891,7 @@ class WorkflowService:
     def _complete_video_job(self, job: dict, result: dict) -> None:
         project = self.store.get(job["project_id"])
         asset_url = str(result["asset_url"])
+        provider_cost = result.get("cost") if isinstance(result.get("cost"), (int, float)) else None
         completed_at = now_iso()
         project_to_save = None
         if project is not None:
@@ -758,7 +917,7 @@ class WorkflowService:
                     "completed_at": completed_at,
                     "task_id": task_id,
                     "job_id": job["id"],
-                    "cost": None,
+                    "cost": provider_cost,
                     "stale": stale,
                 }
                 asset.setdefault("versions", []).append(version)
@@ -766,7 +925,7 @@ class WorkflowService:
                     "asset_url": asset_url,
                     "completed_at": completed_at,
                     "task_id": task_id,
-                    "cost": None,
+                    "cost": provider_cost,
                     "error": None,
                     "provider_status": "completed",
                     "status": "stale" if stale else "ready",
@@ -779,18 +938,20 @@ class WorkflowService:
                 self._refresh_video_stage_status(project)
                 project["updated_at"] = completed_at
                 project_to_save = project
-        self.store.update_video_job(
+        completed_job = self.store.update_video_job(
             job["id"],
             {
                 "status": "completed",
                 "provider_status": "completed",
                 "result_url": asset_url,
+                "cost": provider_cost,
                 "completed_at": completed_at,
                 "next_poll_at": None,
                 "last_poll_error": None,
             },
             project=project_to_save,
         )
+        self._record_video_job_usage(completed_job, "completed", cost=provider_cost)
 
     def generate_shot_video(
         self, project_id: str, shot_id: str, *, confirm_uncertain: bool = False
@@ -856,10 +1017,97 @@ class WorkflowService:
         self._refresh_video_stage_status(project)
         project["updated_at"] = created
         try:
+            self.usage.begin_media_call(
+                project_id=project_id,
+                modality="video",
+                model_id=profile_id,
+                operation="workflow.shot_video",
+                event_id=job_id,
+                created_at=created,
+                status="queued",
+            )
+        except UsageLimitExceeded as exc:
+            self.usage.record(
+                project_id=project_id,
+                modality="video",
+                model_id=profile_id,
+                operation="workflow.shot_video",
+                status="blocked_limit",
+                error_category="daily_limit",
+                event_id=job_id,
+                created_at=created,
+            )
+            raise WorkflowError(str(exc), 429) from exc
+        try:
             self.store.enqueue_video_job(project, job)
         except VideoJobConflict as exc:
+            self._record_video_job_usage(job, "cancelled")
             raise WorkflowError(str(exc), 409) from exc
+        except Exception:
+            self._record_video_job_usage(job, "cancelled")
+            raise
         self.video_job_worker.wake()
+        return project
+
+    def cancel_queued_shot_video(self, project_id: str, shot_id: str) -> dict:
+        project = self.get_project(project_id)
+        shot = self._get_shot(project, shot_id)
+        job = self.store.latest_video_job(project_id, shot_id)
+        if not job:
+            raise WorkflowError("找不到这个镜头的视频任务。", 404)
+        if job.get("status") != "queued":
+            task_id = job.get("provider_task_id") or "尚无供应商任务 ID"
+            raise WorkflowError(
+                f"只有尚未提交的本地排队任务可取消。此任务已进入 {job.get('status')} 阶段，不能据此声称供应商任务已取消；供应商任务：{task_id}。",
+                409,
+            )
+        asset = shot.setdefault("video", {})
+        if asset.get("job_id") != job["id"]:
+            raise WorkflowError("当前镜头已关联其他视频任务，未执行取消。", 409)
+        cancelled_at = now_iso()
+        message = "本地队列任务已取消；未提交给供应商。"
+        asset.update({"status": "cancelled", "completed_at": cancelled_at, "error": message, "provider_status": "本地排队任务已取消"})
+        project["updated_at"] = cancelled_at
+        cancelled = self.store.cancel_queued_video_job(
+            job["id"], {"cancelled_at": cancelled_at, "error": message}, project
+        )
+        if cancelled is None:
+            raise WorkflowError("任务已开始提交，无法再取消本地队列；请核对供应商状态。", 409)
+        self._record_video_job_usage(cancelled, "cancelled")
+        return project
+
+    def resume_shot_video_polling(self, project_id: str, shot_id: str) -> dict:
+        project = self.get_project(project_id)
+        shot = self._get_shot(project, shot_id)
+        job = self.store.latest_video_job(project_id, shot_id)
+        if not job or job.get("status") not in {"timed_out", "stalled"}:
+            raise WorkflowError("只有监控超时或查询暂停的任务可恢复查询。", 409)
+        if not job.get("provider_task_id"):
+            raise WorkflowError("本地记录没有供应商任务 ID，无法恢复查询；请先到供应商侧核对。", 409)
+        asset = shot.setdefault("video", {})
+        if asset.get("job_id") != job["id"]:
+            raise WorkflowError("当前镜头已关联其他视频任务，未恢复查询。", 409)
+        resumed_at = datetime.now(timezone.utc)
+        asset.update({"status": "generating", "error": None, "completed_at": None, "provider_status": "已恢复供应商状态查询"})
+        project["updated_at"] = resumed_at.isoformat()
+        updates = {
+            "next_poll_at": resumed_at.isoformat(),
+            "deadline_at": (resumed_at + timedelta(seconds=self.settings.video_job_timeout_seconds)).isoformat(),
+            "poll_failures": 0,
+            "error": None,
+            "error_category": None,
+            "last_poll_error": None,
+            "resumed_at": resumed_at.isoformat(),
+        }
+        try:
+            resumed = self.store.resume_video_job(job["id"], updates, project)
+        except VideoJobConflict as exc:
+            raise WorkflowError(str(exc), 409) from exc
+        if resumed is None:
+            raise WorkflowError("任务状态已变化，无法恢复查询；请刷新后重试。", 409)
+        self._record_video_job_usage(resumed, "polling")
+        if self.video_job_worker is not None:
+            self.video_job_worker.wake()
         return project
 
     def update_content(self, project_id: str, stage: str, content: str) -> dict:

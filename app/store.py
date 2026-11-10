@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -90,6 +91,24 @@ class ProjectStore:
                 """CREATE UNIQUE INDEX IF NOT EXISTS idx_video_jobs_active_shot
                    ON video_jobs(project_id, shot_id)
                    WHERE status IN ('queued', 'submitting', 'polling')"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS usage_events (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT,
+                    created_at TEXT NOT NULL,
+                    modality TEXT NOT NULL,
+                    model_id TEXT,
+                    operation TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_events_project_created ON usage_events(project_id, created_at DESC)"
             )
 
     @staticmethod
@@ -203,6 +222,57 @@ class ProjectStore:
             ).fetchone()
         return json.loads(row["payload"]) if row else None
 
+    def cancel_queued_video_job(
+        self, job_id: str, updates: dict[str, Any], project: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload FROM video_jobs WHERE id = ? AND status = 'queued'", (job_id,)
+            ).fetchone()
+            if not row:
+                return None
+            job = json.loads(row["payload"])
+            job.update(updates)
+            job["status"] = "cancelled"
+            job["updated_at"] = datetime.now(timezone.utc).isoformat()
+            job["next_poll_at"] = None
+            connection.execute(
+                "UPDATE video_jobs SET status = ?, updated_at = ?, next_poll_at = NULL, payload = ? WHERE id = ? AND status = 'queued'",
+                (job["status"], job["updated_at"], json.dumps(job, ensure_ascii=False), job_id),
+            )
+            self._save_project_record(connection, project)
+        return job
+
+    def resume_video_job(
+        self, job_id: str, updates: dict[str, Any], project: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload FROM video_jobs WHERE id = ? AND status IN ('timed_out', 'stalled')",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return None
+            job = json.loads(row["payload"])
+            active = connection.execute(
+                """SELECT id FROM video_jobs WHERE project_id = ? AND shot_id = ?
+                   AND id != ? AND status IN ('queued', 'submitting', 'polling') LIMIT 1""",
+                (job["project_id"], job["shot_id"], job_id),
+            ).fetchone()
+            if active:
+                raise VideoJobConflict("这个镜头已有正在处理的视频任务，无法恢复查询。")
+            job.update(updates)
+            job["status"] = "polling"
+            job["updated_at"] = datetime.now(timezone.utc).isoformat()
+            connection.execute(
+                "UPDATE video_jobs SET status = ?, updated_at = ?, next_poll_at = ?, payload = ? WHERE id = ?",
+                (job["status"], job["updated_at"], job.get("next_poll_at"), json.dumps(job, ensure_ascii=False), job_id),
+            )
+            self._save_project_record(connection, project)
+        return job
+
     def update_video_job(
         self,
         job_id: str,
@@ -293,6 +363,144 @@ class ProjectStore:
                 (attachment_id, project_id),
             )
         return json.loads(row["payload"])
+
+    def list_chat_attachments(self, project_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            if project_id:
+                rows = connection.execute(
+                    "SELECT payload FROM chat_attachments WHERE project_id = ? ORDER BY created_at",
+                    (project_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT payload FROM chat_attachments ORDER BY created_at"
+                ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def list_unreferenced_chat_attachments(self, project_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            if project_id:
+                rows = connection.execute(
+                    "SELECT id, payload FROM chat_attachments WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+                message_rows = connection.execute(
+                    "SELECT payload FROM chat_messages WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute("SELECT id, payload FROM chat_attachments").fetchall()
+                message_rows = connection.execute("SELECT payload FROM chat_messages").fetchall()
+        referenced_ids = set()
+        for row in message_rows:
+            message = json.loads(row["payload"])
+            referenced_ids.update(
+                str(item["id"])
+                for item in message.get("attachments", [])
+                if isinstance(item, dict) and item.get("id")
+            )
+        return [json.loads(row["payload"]) for row in rows if row["id"] not in referenced_ids]
+
+    def delete_unreferenced_chat_attachments(
+        self, project_id: str | None = None, attachment_ids: set[str] | None = None
+    ) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if project_id:
+                rows = connection.execute(
+                    "SELECT id, payload FROM chat_attachments WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+                message_rows = connection.execute(
+                    "SELECT payload FROM chat_messages WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute("SELECT id, payload FROM chat_attachments").fetchall()
+                message_rows = connection.execute("SELECT payload FROM chat_messages").fetchall()
+            referenced_ids = set()
+            for row in message_rows:
+                message = json.loads(row["payload"])
+                referenced_ids.update(
+                    str(item["id"])
+                    for item in message.get("attachments", [])
+                    if isinstance(item, dict) and item.get("id")
+                )
+            removed = []
+            for row in rows:
+                if row["id"] in referenced_ids or (attachment_ids is not None and row["id"] not in attachment_ids):
+                    continue
+                removed.append(json.loads(row["payload"]))
+                connection.execute("DELETE FROM chat_attachments WHERE id = ?", (row["id"],))
+        return removed
+
+    def record_usage_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT INTO usage_events (id, project_id, created_at, modality, model_id, operation, status, payload)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     project_id = excluded.project_id,
+                     modality = excluded.modality,
+                     model_id = excluded.model_id,
+                     operation = excluded.operation,
+                     status = excluded.status,
+                     payload = excluded.payload""",
+                (
+                    event["id"], event.get("project_id"), event["created_at"],
+                    event["modality"], event.get("model_id"), event["operation"],
+                    event["status"], json.dumps(event, ensure_ascii=False),
+                ),
+            )
+        return event
+
+    def list_usage_events(self, *, limit: int = 500, project_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            if project_id:
+                rows = connection.execute(
+                    "SELECT payload FROM usage_events WHERE project_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (project_id, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT payload FROM usage_events ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def count_usage_events_since(self, since: str, *, modalities: set[str]) -> int:
+        if not modalities:
+            return 0
+        placeholders = ", ".join("?" for _ in modalities)
+        with self._connection() as connection:
+            row = connection.execute(
+                f"""SELECT COUNT(*) AS total FROM usage_events
+                    WHERE created_at >= ? AND modality IN ({placeholders})
+                      AND status NOT IN ('blocked_limit', 'cancelled')""",
+                (since, *sorted(modalities)),
+            ).fetchone()
+        return int(row["total"])
+
+    def media_storage_references(self) -> set[str]:
+        pattern = re.compile(r"(?:^|/)media/([^/?#]+)")
+        references: set[str] = set()
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, str):
+                references.update(match.group(1) for match in pattern.finditer(value))
+
+        with self._connection() as connection:
+            for table in ("projects", "chat_messages", "chat_attachments"):
+                rows = connection.execute(f"SELECT payload FROM {table}").fetchall()
+                for row in rows:
+                    collect(json.loads(row["payload"]))
+        return references
 
     def chat_history(self, project_id: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._connection() as connection:

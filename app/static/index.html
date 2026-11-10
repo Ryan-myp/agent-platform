@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#f5f8f7" />
     <meta name="description" content="通过对话生成并逐步确认脚本、图片、视频和音频内容。" />
     <title>片场 · AI 内容创作台</title>
-    <link rel="stylesheet" href="/static/style.css?v=15" />
-    <script src="/static/app.js?v=14" defer></script>
+    <link rel="stylesheet" href="/static/style.css?v=16" />
+    <script src="/static/app.js?v=16" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -20,6 +20,7 @@
           <button class="sidebar-action new-project" id="new-project" type="button"><span aria-hidden="true">＋</span> 新对话</button>
           <button class="sidebar-action new-workflow" id="new-workflow" type="button"><span aria-hidden="true">▧</span> 创作流程</button>
           <button class="sidebar-action records-action" id="open-records" type="button"><span aria-hidden="true">▤</span> 制作记录</button>
+          <button class="sidebar-action" id="open-usage" type="button"><span aria-hidden="true">◷</span> 用量与存储</button>
         </div>
         <div class="side-heading">最近对话</div>
         <nav id="project-list" class="project-list" aria-label="最近对话"></nav>
@@ -59,6 +60,29 @@
         <div id="model-editor-host"></div>
         <p id="model-config-status" class="model-config-status" role="status" aria-live="polite"></p>
         <div id="model-profiles" class="model-profiles"></div>
+      </section>
+    </dialog>
+
+    <dialog id="usage-dialog" class="models-dialog" aria-labelledby="usage-title">
+      <section class="models-window usage-window">
+        <header class="chat-header">
+          <div><p class="section-kicker">本地记录</p><h2 id="usage-title">用量与存储</h2></div>
+          <button class="dialog-close" id="close-usage" type="button" aria-label="关闭用量与存储">×</button>
+        </header>
+        <p class="models-help">用量来自本地调用记录；成本仅展示供应商返回的已知金额，不等同于供应商账单。媒体每日上限由 MEDIA_GENERATION_DAILY_LIMIT 控制，0 表示不限。</p>
+        <section class="usage-section" aria-labelledby="usage-summary-title">
+          <h3 id="usage-summary-title">调用统计</h3>
+          <div id="usage-summary" class="usage-summary" aria-live="polite">正在读取本地用量…</div>
+        </section>
+        <section class="usage-section storage-cleanup" aria-labelledby="storage-cleanup-title">
+          <div class="storage-cleanup-heading">
+            <div><h3 id="storage-cleanup-title">未引用的本地文件</h3><p>只列出数据库中未发现引用的附件记录和媒体文件。删除前会再次检查引用，并且不会删除仍被项目或聊天使用的文件。</p></div>
+            <button class="button button-subtle" id="preview-storage-cleanup" type="button">扫描本地存储</button>
+          </div>
+          <div id="storage-cleanup-list" class="storage-cleanup-list" aria-live="polite">尚未扫描。</div>
+          <p id="storage-cleanup-status" class="model-config-status" role="status" aria-live="polite"></p>
+          <button class="button button-danger" id="confirm-storage-cleanup" type="button" disabled>删除选中的未引用项目</button>
+        </section>
       </section>
     </dialog>
 

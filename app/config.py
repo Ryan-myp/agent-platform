@@ -9,6 +9,14 @@ from app.providers.catalog import ModelCatalog, ModelProfile, env_api_keys
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _int_env(name: str, default: int) -> int:
+    value = os.getenv(name, str(default))
+    try:
+        return int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be an integer; received {value!r}.") from error
+
+
 @dataclass(frozen=True)
 class Settings:
     database_path: Path
@@ -16,6 +24,8 @@ class Settings:
     model_catalog: ModelCatalog
     api_keys: dict[str, str]
     model_credentials: dict[str, str] = field(default_factory=dict)
+    media_generation_daily_limit: int = 0
+    video_job_timeout_seconds: int = 300
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -26,6 +36,8 @@ class Settings:
             model_catalog_path=catalog_path,
             model_catalog=catalog,
             api_keys=env_api_keys(catalog),
+            media_generation_daily_limit=max(0, _int_env("MEDIA_GENERATION_DAILY_LIMIT", 0)),
+            video_job_timeout_seconds=max(60, _int_env("VIDEO_JOB_TIMEOUT_SECONDS", 300)),
         )
 
     def api_key(self, env_name: str) -> str:

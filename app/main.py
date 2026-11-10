@@ -29,6 +29,7 @@ from app.models import (
     ModelUpdate,
     ProjectCreate,
     ProjectTitleUpdate,
+    StorageCleanupRequest,
 )
 from app.providers.media import AssetStore, ImageProvider, MediaProviderError, VideoProvider, create_audio_provider
 from app.providers.catalog import MODALITIES, SUPPORTED_ADAPTERS, ModelCatalog, ModelProfile
@@ -41,6 +42,7 @@ from app.services.attachments import (
 from app.services.chat import ChatService
 from app.services.workflow import WorkflowError, WorkflowService
 from app.services.video_jobs import VideoJobWorker
+from app.services.usage import UsageService
 from app.skills.loader import SkillLoader
 from app.store import ProjectStore
 
@@ -157,11 +159,12 @@ def create_app(
     skill_loader = SkillLoader(ROOT / "skills")
     media_path = current_settings.database_path.parent / "media"
     assets = AssetStore(media_path)
-    workflow = WorkflowService(store, current_settings, skill_loader, video_provider, image_provider, assets)
+    usage = UsageService(store, current_settings.media_generation_daily_limit)
+    workflow = WorkflowService(store, current_settings, skill_loader, video_provider, image_provider, assets, usage)
     video_job_worker = VideoJobWorker(workflow, store)
     workflow.video_job_worker = video_job_worker
     chat_attachments = ChatAttachmentService(store, assets)
-    chat = ChatService(store, current_settings, assets, chat_attachments)
+    chat = ChatService(store, current_settings, assets, chat_attachments, usage)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -180,6 +183,7 @@ def create_app(
     application.state.workflow = workflow
     application.state.chat = chat
     application.state.chat_attachments = chat_attachments
+    application.state.usage = usage
     application.state.assets = assets
     application.state.model_credentials = credential_store
     application.state.video_job_worker = video_job_worker
@@ -218,6 +222,26 @@ def create_app(
     @application.get("/api/config")
     def get_config() -> dict:
         return workflow.config_view()
+
+    @application.get("/api/usage")
+    def get_usage() -> dict:
+        return usage.summary()
+
+    @application.get("/api/storage/cleanup/preview")
+    def preview_storage_cleanup() -> dict:
+        return chat_attachments.preview_storage_cleanup()
+
+    @application.post("/api/storage/cleanup")
+    def confirm_storage_cleanup(payload: StorageCleanupRequest) -> dict:
+        if not payload.confirm:
+            raise HTTPException(status_code=409, detail="请先预览候选项并明确确认本地存储清理。")
+        try:
+            return chat_attachments.confirm_storage_cleanup(
+                attachment_ids=payload.attachment_ids,
+                storage_keys=payload.storage_keys,
+            )
+        except ChatAttachmentError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @application.get("/api/config/models/{profile_id}/credential")
     def get_model_credential(profile_id: str, request: Request) -> JSONResponse:
@@ -367,6 +391,14 @@ def create_app(
         if shot.get("video", {}).get("status") == "queued":
             return JSONResponse(status_code=202, content=result)
         return result
+
+    @application.post("/api/projects/{project_id}/shots/{shot_id}/video/cancel")
+    def cancel_shot_video(project_id: str, shot_id: str) -> dict:
+        return run(workflow.cancel_queued_shot_video, project_id, shot_id)
+
+    @application.post("/api/projects/{project_id}/shots/{shot_id}/video/resume")
+    def resume_shot_video_polling(project_id: str, shot_id: str) -> dict:
+        return run(workflow.resume_shot_video_polling, project_id, shot_id)
 
     @application.put("/api/projects/{project_id}/content/{stage}")
     def update_content(project_id: str, stage: str, payload: ContentUpdate) -> dict:
