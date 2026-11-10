@@ -190,6 +190,7 @@ class SeriesService:
             "description": str(data.get("description", "")).strip(),
             "visual_prompt": str(data.get("visual_prompt", "")).strip(),
             "continuity_notes": str(data.get("continuity_notes", "")).strip(),
+            "media": [],
             "archived": False,
             "created_at": now,
             "updated_at": now,
@@ -209,4 +210,35 @@ class SeriesService:
         if "archived" in updates:
             asset["archived"] = bool(updates["archived"])
         asset["updated_at"] = _now()
+        return self.store.save_series_asset(asset)
+
+    def add_asset_media(self, series_id: str, asset_id: str, items: list[dict]) -> dict:
+        series = self.store.get_series(series_id)
+        if not series:
+            raise SeriesError("找不到这个系列。", 404)
+        asset = self.store.get_series_asset(series_id, asset_id)
+        if not asset:
+            raise SeriesError("找不到这个系列资产。", 404)
+        if series.get("archived") or asset.get("archived"):
+            raise SeriesError("已归档的系列或资产不能添加媒体。", 409)
+        if not items:
+            raise SeriesError("请选择至少一个本地图片文件。", 422)
+        current = asset.setdefault("media", [])
+        if len(current) + len(items) > 8:
+            raise SeriesError("每个系列资产最多关联 8 张本地参考图。", 413)
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("asset_url"), str) or not item["asset_url"].startswith("/media/"):
+                raise SeriesError("本地参考图记录无效。", 422)
+            current.append({
+                "id": str(uuid4()),
+                "asset_url": item["asset_url"],
+                "filename": str(item.get("filename") or "reference")[:180],
+                "mime_type": str(item.get("mime_type") or "image/png"),
+                "size": int(item.get("size") or 0),
+                "sha256": str(item.get("sha256") or ""),
+                "created_at": _now(),
+            })
+        asset["updated_at"] = _now()
+        series["updated_at"] = asset["updated_at"]
+        self.store.save_series(series)
         return self.store.save_series_asset(asset)

@@ -16,6 +16,15 @@ class ProjectCreate(BaseModel):
     model: str | None = None
     series_id: str | None = Field(default=None, max_length=64)
     episode_number: int | None = Field(default=None, ge=1, le=9999)
+    output_aspect_ratio: Literal["9:16", "16:9", "1:1", "4:3", "3:4", "2:3", "3:2", "21:9"] = "9:16"
+    output_frame_mode: Literal["pad", "crop"] = "pad"
+    output_preset: Literal["compact", "standard", "quality"] = "standard"
+
+
+class AssemblySettingsUpdate(BaseModel):
+    output_aspect_ratio: Literal["9:16", "16:9", "1:1", "4:3", "3:4", "2:3", "3:2", "21:9"]
+    output_frame_mode: Literal["pad", "crop"] = "pad"
+    output_preset: Literal["compact", "standard", "quality"] = "standard"
 
 
 class ChatSessionCreate(BaseModel):
@@ -24,6 +33,62 @@ class ChatSessionCreate(BaseModel):
 
 
 class GenerateRequest(BaseModel):
+    model: str | None = None
+
+
+class EpisodeOutlineUpdate(BaseModel):
+    content: str = Field(min_length=1, max_length=12000)
+    status: Literal["draft", "approved"] = "draft"
+
+
+class ShotAssetsUpdate(BaseModel):
+    asset_ids: list[str] = Field(default_factory=list, max_length=20)
+
+
+class RenderOrderUpdate(BaseModel):
+    shot_ids: list[str] = Field(min_length=1, max_length=24)
+
+
+class NovelCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    logline: str = Field(default="", max_length=3000)
+    genre: str = Field(default="", max_length=300)
+    world_setting: str = Field(default="", max_length=5000)
+    central_theme: str = Field(default="", max_length=2000)
+    protagonist: str = Field(default="", max_length=3000)
+    character_arcs: str = Field(default="", max_length=5000)
+    ending: str = Field(default="", max_length=3000)
+    tone: str = Field(default="", max_length=1000)
+    content_boundaries: str = Field(default="", max_length=2000)
+
+
+class NovelUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    logline: str | None = Field(default=None, max_length=3000)
+    genre: str | None = Field(default=None, max_length=300)
+    world_setting: str | None = Field(default=None, max_length=5000)
+    central_theme: str | None = Field(default=None, max_length=2000)
+    protagonist: str | None = Field(default=None, max_length=3000)
+    character_arcs: str | None = Field(default=None, max_length=5000)
+    ending: str | None = Field(default=None, max_length=3000)
+    tone: str | None = Field(default=None, max_length=1000)
+    content_boundaries: str | None = Field(default=None, max_length=2000)
+
+
+class NovelChapterCreate(BaseModel):
+    chapter_number: int = Field(ge=1, le=9999)
+    title: str = Field(min_length=1, max_length=160)
+    outline: str = Field(default="", max_length=12000)
+
+
+class NovelChapterUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=160)
+    outline: str | None = Field(default=None, max_length=12000)
+    content: str | None = Field(default=None, max_length=100000)
+
+
+class NovelChapterGenerateRequest(BaseModel):
+    kind: Literal["outline", "chapter"] = "chapter"
     model: str | None = None
 
 

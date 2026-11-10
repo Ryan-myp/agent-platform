@@ -227,6 +227,12 @@ h1, h2, p { margin-top: 0; }
 .quality-results li + li { margin-top: 3px; }
 .quality-results .is-error { color: #9b4035; }
 .quality-results .is-warning { color: #805d2d; }
+.narrative-review { margin-top: 10px; border-top: 1px solid #e2e9e4; padding-top: 8px; }
+.narrative-review > strong { color: #34483f; }
+.narrative-review ul { margin-top: 5px; }
+.narrative-review .narrative-signal_found { color: #3e6654; }
+.narrative-review .narrative-not_detected { color: #805d2d; }
+.narrative-review p { margin: 6px 0 0; color: #707d74; font-size: 9px; }
 .editor-actions { display: flex; align-items: center; gap: 12px; border-top: 1px solid #e5e8e0; padding: 10px 13px; }
 .editor-actions > span { color: var(--muted); font-size: 10px; }
 .empty-stage { min-height: 260px; display: grid; place-content: center; justify-items: center; gap: 12px; color: #737f76; }
@@ -275,6 +281,26 @@ h1, h2, p { margin-top: 0; }
 .asset-version-history li { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 9px; overflow-wrap: anywhere; }
 .asset-version-history a { color: var(--accent-dark); }
 .video-no-merge-note { margin: 0; color: #68776e; font-size: 10px; line-height: 1.6; }
+.shot-assignment { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 8px 12px; border-top: 1px solid #edf0ed; padding-top: 10px; }
+.shot-assignment label { display: grid; gap: 5px; color: #52645a; font-size: 10px; font-weight: 600; }
+.shot-assignment select { width: 100%; min-width: 0; border: 1px solid #d6dcd3; border-radius: 3px; background: #fff; color: var(--ink); padding: 7px; font: inherit; font-weight: 400; }
+.shot-assignment small { grid-column: 1 / -1; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.local-assembly-card { display: grid; gap: 12px; border: 1px solid #cfddd5; background: #f8fbf9; padding: 15px; }
+.local-assembly-card > p { margin: 0; color: #607168; font-size: 10px; line-height: 1.6; }
+.assembly-settings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.assembly-settings-grid label { display: grid; gap: 5px; color: #53655b; font-size: 10px; font-weight: 600; }
+.assembly-settings-grid select { min-width: 0; border: 1px solid #d6e0da; border-radius: 3px; background: #fff; color: #304239; padding: 7px; font: inherit; font-weight: 400; }
+.subtitle-downloads { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; border-top: 1px solid #e3ebe6; padding-top: 9px; color: #53655b; font-size: 10px; }
+.assembly-subtitle-note { border-left: 2px solid #c2d2c9; padding-left: 9px; }
+.render-order-list { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.render-order-list li { display: flex; align-items: center; gap: 9px; border-top: 1px solid #e5ece7; padding: 7px 2px; }
+.render-order-number { flex: 0 0 24px; display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: #e4efe9; color: #426453; font-size: 10px; font-weight: 700; }
+.render-order-name { min-width: 0; display: grid; gap: 2px; flex: 1; }
+.render-order-name strong { color: #34483f; font-size: 10px; }
+.render-order-name small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.render-order-actions, .local-assembly-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.local-assembly-actions { flex-wrap: wrap; }
+.assembly-stale-note { margin: 0; border-left: 2px solid #b8864e; background: #fff8ed; padding: 8px 10px; color: #76572f; font-size: 10px; line-height: 1.5; }
 .record-shot-list { display: grid; gap: 12px; }
 .record-shot-card { min-width: 0; border: 1px solid #e3eae5; background: #fbfcfb; padding: 12px; }
 .record-shot-card > header { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 9px; color: #506157; font-size: 10px; }
@@ -293,6 +319,12 @@ h1, h2, p { margin-top: 0; }
 .load-error h1 { font-size: 20px; }
 .load-error p { margin-bottom: 0; color: var(--muted); }
 .compatibility-banner { border-bottom: 1px solid #e0c48f; background: #fff8e9; padding: 9px clamp(18px, 4vw, 42px); color: #76572f; font-size: 11px; line-height: 1.6; }
+.compatibility-refresh { border: 0; background: transparent; color: #5f4726; padding: 0; font: inherit; font-weight: 700; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.system-diagnostics { border-top: 1px solid rgba(255, 255, 255, .12); padding: 8px 15px; color: #c4d1c9; font-size: 10px; }
+.system-diagnostics summary { width: fit-content; cursor: pointer; }
+.system-diagnostics dl { display: grid; grid-template-columns: minmax(60px, auto) minmax(0, 1fr); gap: 4px 9px; margin: 8px 0 0; line-height: 1.4; }
+.system-diagnostics dt { color: #91a49a; }
+.system-diagnostics dd { margin: 0; overflow-wrap: anywhere; color: #dce5df; }
 
 .topbar-actions { display: flex; align-items: center; gap: 9px; }
 .topbar-button { min-height: 34px; padding: 0 11px; font-size: 11px; white-space: nowrap; }
@@ -558,12 +590,55 @@ h1, h2, p { margin-top: 0; }
 .series-asset-item summary > strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .series-asset-item summary .series-archive-badge { margin-left: auto; }
 .series-asset-form { border: 0; border-top: 1px solid #e2e8e4; background: #fff; }
+.series-asset-media { display: grid; gap: 8px; border-top: 1px solid #e2e8e4; padding-top: 10px; }
+.series-asset-media h3 { margin: 0; color: #40554a; font-size: 11px; }
+.series-asset-media > label { display: grid; gap: 5px; color: #586a60; font-size: 10px; }
+.series-asset-media > label small { color: #77847d; font-size: 9px; font-weight: 400; }
+.series-asset-media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; }
+.series-asset-media-grid figure { min-width: 0; margin: 0; border: 1px solid #e1e8e3; background: #fafcfb; padding: 5px; }
+.series-asset-media-grid img { display: block; width: 100%; height: 100px; object-fit: contain; background: #edf1ee; }
+.series-asset-media-grid figcaption { margin-top: 5px; overflow-wrap: anywhere; color: #66766d; font-size: 9px; line-height: 1.4; }
+.series-form-hint { margin: 0; color: #78857d; font-size: 9px; }
 .series-archive-toggle { display: flex !important; grid-template-columns: auto 1fr; align-items: center; justify-content: flex-start; gap: 8px !important; color: #586960 !important; font-weight: 500 !important; }
 .series-archive-toggle input { width: 16px; height: 16px; accent-color: var(--accent-dark); }
 .series-association { display: grid; gap: 12px; border-left: 3px solid var(--accent); background: #f1f7f4; padding: 14px 16px; }
 .series-association h2 { margin: 0; font-size: 14px; font-weight: 600; }
 .series-association .form-row { margin: 0; }
 .series-association .form-note { margin: 0; }
+.episode-outline-card { display: grid; gap: 9px; margin: 3px 0 0 37px; border: 1px solid #e4ebe6; background: #fbfcfb; padding: 9px; }
+.episode-outline-card > summary, .episode-outline-history > summary { color: var(--accent-dark); font-size: 10px; font-weight: 600; cursor: pointer; }
+.episode-outline-card > p { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.episode-outline-card label { display: grid; gap: 5px; color: #38443d; font-size: 10px; font-weight: 600; }
+.episode-outline-card textarea { width: 100%; min-width: 0; border: 1px solid #d6dcd3; background: #fff; padding: 8px; color: var(--ink); font: inherit; font-weight: 400; line-height: 1.55; resize: vertical; }
+.episode-outline-actions, .novel-chapter-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.episode-outline-history { border-top: 1px solid #e8eeea; padding-top: 7px; }
+.episode-outline-history ol, .novel-revisions ol { display: grid; gap: 9px; padding-left: 20px; }
+.episode-outline-history li, .novel-revisions li { color: #5f6e66; font-size: 10px; line-height: 1.6; overflow-wrap: anywhere; }
+.episode-outline-history p, .novel-revisions p { margin: 5px 0; white-space: pre-wrap; }
+.novel-screen { display: grid; gap: 18px; }
+.novel-create-form, .novel-bible-panel { max-width: 900px; }
+.novel-list { display: grid; border-top: 1px solid var(--line); }
+.novel-list-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; border-bottom: 1px solid var(--line); padding: 16px 7px; }
+.novel-list-row h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.novel-list-row p { max-width: 700px; margin: 6px 0; color: #5e6e66; font-size: 11px; line-height: 1.55; }
+.novel-list-row small { color: var(--muted); font-size: 10px; }
+.novel-guidance { margin: 6px 0 13px; color: var(--muted); font-size: 10px; line-height: 1.6; }
+.novel-bible-form { grid-template-columns: repeat(2, minmax(0, 1fr)); border: 0; background: transparent; padding: 0; }
+.novel-bible-form .series-form-status, .novel-bible-form .series-form-actions { grid-column: 1 / -1; }
+.novel-chapter-create { margin: 12px 0 16px; background: #fbfcfb; }
+.novel-chapter-create h3 { margin: 0; font-size: 13px; }
+.novel-chapter-card { display: grid; gap: 12px; border: 1px solid #dfe7e2; background: #fff; padding: 16px; }
+.novel-chapter-card > header { border-bottom: 1px solid #edf0ed; padding-bottom: 9px; }
+.novel-chapter-card > header .section-kicker { margin: 0 0 4px; color: var(--accent-dark); font-size: 9px; }
+.novel-chapter-card > header h3 { margin: 0; font-size: 15px; }
+.novel-stale-note { margin: 6px 0 0; color: #9a5327; font-size: 10px; line-height: 1.5; }
+.novel-chapter-card > label { display: grid; gap: 5px; color: #38443d; font-size: 10px; font-weight: 600; }
+.novel-chapter-card input, .novel-chapter-card textarea { width: 100%; min-width: 0; border: 1px solid #d6dcd3; border-radius: 3px; background: #fff; color: var(--ink); padding: 9px; font: inherit; font-weight: 400; line-height: 1.6; }
+.novel-chapter-card textarea { resize: vertical; }
+.novel-chapter-card [data-novel-content] { min-height: 300px; }
+.novel-revisions { border-top: 1px solid #e8eeea; padding-top: 9px; }
+.novel-revisions > summary { color: var(--accent-dark); font-size: 10px; font-weight: 600; cursor: pointer; }
+.novel-chapter-list { display: grid; gap: 12px; }
 
 @media (max-width: 940px) {
   .app-shell { grid-template-columns: 220px minmax(0, 1fr); }
@@ -611,8 +686,8 @@ h1, h2, p { margin-top: 0; }
   .series-heading > .button { width: 100%; }
   .series-heading-actions, .series-heading-tools { width: 100%; }
   .series-heading-actions .button, .series-heading-tools .button { flex: 1; }
-  .series-list-row { align-items: flex-start; flex-direction: column; gap: 12px; padding: 14px 4px; }
-  .series-list-row > .button { width: 100%; }
+  .series-list-row, .novel-list-row { align-items: flex-start; flex-direction: column; gap: 12px; padding: 14px 4px; }
+  .series-list-row > .button, .novel-list-row > .button { width: 100%; }
   .series-detail-nav { align-items: flex-start; }
   .series-detail-heading { border-bottom: 0; }
   .series-detail-grid { grid-template-columns: 1fr; gap: 10px; }
@@ -622,6 +697,11 @@ h1, h2, p { margin-top: 0; }
   .series-form { padding: 14px; }
   .series-form-actions .button { flex: 1; }
   .series-association { padding: 13px; }
+  .episode-outline-card { margin-left: 0; }
+  .novel-bible-form { grid-template-columns: 1fr; }
+  .novel-bible-form .series-form-status, .novel-bible-form .series-form-actions { grid-column: auto; }
+  .shot-assignment { grid-template-columns: 1fr; }
+  .shot-assignment small { grid-column: auto; }
   .records-heading h1 { font-size: 25px; }
   .record-detail-nav { flex-wrap: wrap; }
   .record-detail-actions { width: 100%; }
@@ -639,7 +719,7 @@ h1, h2, p { margin-top: 0; }
   .record-video-card { grid-column: auto; }
   .record-output-card { padding: 14px; }
   .record-output-card > header { flex-wrap: wrap; }
-  .form-row, .form-row-three { grid-template-columns: 1fr; }
+  .form-row, .form-row-three, .assembly-settings-grid { grid-template-columns: 1fr; }
   .brief-form input, .brief-form textarea, .brief-form select { font-size: 16px; }
   .form-footer { align-items: flex-start; flex-direction: column; }
   .workflow-preview { flex-wrap: wrap; row-gap: 12px; }

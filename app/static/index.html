@@ -6,8 +6,9 @@
     <meta name="theme-color" content="#f5f8f7" />
     <meta name="description" content="通过对话生成并逐步确认脚本、图片、视频和音频内容。" />
     <title>片场 · AI 内容创作台</title>
-    <link rel="stylesheet" href="/static/style.css?v=22" />
-    <script src="/static/app.js?v=23" defer></script>
+    <meta name="client-bundle-version" content="27" />
+    <link rel="stylesheet" href="/static/style.css?v=25" />
+    <script src="/static/app.js?v=27" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -21,6 +22,7 @@
           <button class="sidebar-action new-workflow" id="new-workflow" type="button"><span aria-hidden="true">▧</span> 创作流程</button>
           <button class="sidebar-action records-action" id="open-records" type="button"><span aria-hidden="true">▤</span> 制作记录</button>
           <button class="sidebar-action series-action" id="open-series" type="button"><span aria-hidden="true">⌘</span> 剧集资产</button>
+          <button class="sidebar-action" id="open-novels" type="button"><span aria-hidden="true">▤</span> 长篇作品</button>
           <button class="sidebar-action" id="open-usage" type="button"><span aria-hidden="true">◷</span> 用量与存储</button>
         </div>
         <div class="side-heading">最近对话</div>
@@ -29,6 +31,10 @@
           <span class="connection-dot" aria-hidden="true"></span>
           <span id="provider-status">正在连接工作台…</span>
         </div>
+        <details class="system-diagnostics" id="system-diagnostics">
+          <summary>运行诊断</summary>
+          <dl id="system-diagnostics-details"><dt>状态</dt><dd>正在读取本机服务信息…</dd></dl>
+        </details>
       </aside>
 
       <main class="main-area">

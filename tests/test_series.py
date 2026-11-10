@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import replace
 from pathlib import Path
 
@@ -102,6 +103,46 @@ def test_series_assets_and_episodes_are_persisted_and_archive_is_non_destructive
     summary = client.get("/api/series").json()
     assert summary[0]["episode_count"] == 2
     assert summary[0]["asset_count"] == 0
+
+
+def test_series_asset_media_upload_is_local_image_only_and_non_destructive(client):
+    headers = {"Origin": "http://testserver"}
+    series = client.post("/api/series", json=series_payload(), headers=headers).json()
+    asset = client.post(f"/api/series/{series['id']}/assets", json={
+        "kind": "character", "name": "林澄", "description": "港口调查员。",
+    }, headers=headers).json()
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/UNkAAAAASUVORK5CYII="
+    )
+    uploaded = client.post(
+        f"/api/series/{series['id']}/assets/{asset['id']}/media",
+        files=[("files", ("../林澄参考.png", png, "image/png"))],
+        headers=headers,
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    media = uploaded.json()["media"]
+    assert len(media) == 1
+    assert media[0]["filename"] == "林澄参考.png"
+    assert media[0]["mime_type"] == "image/png"
+    stored = client.get(media[0]["asset_url"])
+    assert stored.status_code == 200
+    assert stored.headers["x-content-type-options"] == "nosniff"
+    assert stored.content == png
+
+    invalid = client.post(
+        f"/api/series/{series['id']}/assets/{asset['id']}/media",
+        files=[("files", ("script.svg", b"<svg onload='alert(1)'></svg>", "image/svg+xml"))],
+        headers=headers,
+    )
+    assert invalid.status_code == 415
+    assert len(client.get(f"/api/series/{series['id']}").json()["assets"][0]["media"]) == 1
+
+    cross_origin = client.post(
+        f"/api/series/{series['id']}/assets/{asset['id']}/media",
+        files=[("files", ("reference.png", png, "image/png"))],
+        headers={"Origin": "https://attacker.example"},
+    )
+    assert cross_origin.status_code == 403
 
 
 def test_story_bible_and_traceable_continuity_ledger(client, monkeypatch):

@@ -11,6 +11,20 @@ from app.store import ProjectStore
 
 _PLACEHOLDERS = re.compile(r"\b(?:TODO|TBD|FIXME)\b|待补充|待填写|待确认|[（(]待定[）)]", re.IGNORECASE)
 _BLOCKING = re.compile(r"无法(?:直接|继续)?(?:撰写|生成)|信息不足.{0,20}无法|必须补充.{0,20}才能继续")
+_STORY_SIGNALS = {
+    "hook": re.compile(r"突(然|发)|没想到|竟然|就在.{0,16}(?!$)|发现.{0,18}(尸体|秘密|录音|线索|真相|失踪|异常)|收到.{0,16}(信|消息|电话|录音)|失踪|死亡|被困|被抓|必须.{0,16}(离开|逃|找|救|阻止)", re.IGNORECASE),
+    "goal": re.compile(r"(?:想要|想|决定|必须|目标是|计划|试图|发誓|承诺|为了|要去|寻找|追查|救出|阻止).{0,36}", re.IGNORECASE),
+    "obstacle": re.compile(r"但是|然而|却|阻止|拒绝|阻碍|无法|不允许|受阻|代价|威胁|失败|被迫|陷入|否则", re.IGNORECASE),
+    "stakes": re.compile(r"如果.{0,40}(?:就|将|会|否则)|否则.{0,40}(?:就|将|会)|一旦.{0,40}(?:就|将|会)|失去|危及|代价|性命|生命|崩溃|暴露|毁掉|毁灭", re.IGNORECASE),
+    "turn": re.compile(r"突然|没想到|原来|真相|反转|揭开|揭露|暴露|背叛|竟然|却发现|身份.{0,12}(?:是|竟)|计划.{0,12}(?:失败|被识破)", re.IGNORECASE),
+}
+_STORY_LABELS = {
+    "hook": "开场钩子",
+    "goal": "人物目标",
+    "obstacle": "阻碍",
+    "stakes": "风险 / 代价",
+    "turn": "转折",
+}
 
 
 class QualityService:
@@ -69,6 +83,28 @@ class QualityService:
 
         deductions = sum({"error": 35, "warning": 12, "info": 2}.get(item["severity"], 0) for item in findings)
         score = max(0, 100 - deductions) if content.strip() else 0
+        narrative_review = None
+        if stage == "script" and project.get("track") == "drama" and content.strip():
+            dimensions = []
+            for key, pattern in _STORY_SIGNALS.items():
+                search_text = content[:800] if key == "hook" else content
+                match = pattern.search(search_text)
+                excerpt = ""
+                if match:
+                    start = max(0, match.start() - 32)
+                    end = min(len(search_text), match.end() + 48)
+                    excerpt = re.sub(r"\s+", " ", search_text[start:end]).strip()[:120]
+                dimensions.append({
+                    "key": key,
+                    "label": _STORY_LABELS[key],
+                    "status": "signal_found" if match else "not_detected",
+                    "evidence": excerpt,
+                })
+            narrative_review = {
+                "heuristic_only": True,
+                "note": "仅扫描常见叙事信号；未检出不代表缺失，检出也不代表有效，需人工判断因果、人物动机与情绪力度。",
+                "dimensions": dimensions,
+            }
         return {
             "project_id": project_id,
             "stage": stage,
@@ -77,5 +113,6 @@ class QualityService:
             "grade": "需修订" if any(item["severity"] == "error" for item in findings) else "建议复核" if any(item["severity"] == "warning" for item in findings) else "未发现明显问题",
             "heuristic_only": True,
             "findings": findings,
+            "narrative_review": narrative_review,
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }

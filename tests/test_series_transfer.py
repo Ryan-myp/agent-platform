@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -62,6 +63,17 @@ def test_series_bundle_round_trip_copies_assets_episodes_chat_and_media_without_
         "visual_prompt": "深色雨衣，短发。", "continuity_notes": "始终佩戴旧表。",
     }, headers=headers)
     assert asset_response.status_code == 201
+    asset_id = asset_response.json()["id"]
+    reference_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/UNkAAAAASUVORK5CYII="
+    )
+    uploaded_asset = client.post(
+        f"/api/series/{series['id']}/assets/{asset_id}/media",
+        files=[("files", ("character-reference.png", reference_png, "image/png"))],
+        headers=headers,
+    )
+    assert uploaded_asset.status_code == 200, uploaded_asset.text
+    source_asset_media_url = uploaded_asset.json()["media"][0]["asset_url"]
 
     workflow = client.app.state.workflow
     store = workflow.store
@@ -108,6 +120,9 @@ def test_series_bundle_round_trip_copies_assets_episodes_chat_and_media_without_
     assert len(detail["assets"]) == 1
     assert detail["assets"][0]["series_id"] == imported_series["id"]
     assert len(detail["episodes"]) == 2
+    imported_asset_media_url = detail["assets"][0]["media"][0]["asset_url"]
+    assert imported_asset_media_url != source_asset_media_url
+    assert (asset_store.directory / Path(urlsplit(imported_asset_media_url).path).name).read_bytes() == reference_png
 
     imported_episode = next(item for item in imported["episodes"] if item["episode_number"] == 2)
     video = imported_episode["workflow"]["video"]["shots"][0]["video"]

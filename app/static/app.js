@@ -1,12 +1,18 @@
 let videoJobPollTimer = null;
 let videoJobPollInFlight = false;
 let storageCleanupPreview = null;
-const EXPECTED_API_CONTRACT_VERSION = 3;
+const EXPECTED_API_CONTRACT_VERSION = 5;
 
 const state = {
   config: null,
   projects: [],
   series: [],
+  novels: [],
+  activeNovel: null,
+  activeSeriesAssets: [],
+  activeNovelId: null,
+  renderOrderProjectId: null,
+  renderOrderDraft: [],
   selectedSeriesId: null,
   project: null,
   viewStage: null,
@@ -227,9 +233,24 @@ async function api(path, options = {}) {
 function showCompatibilityStatus(status) {
   const banner = document.querySelector("#compatibility-status");
   if (!banner) return;
-  const required = ["series", "series_transfer", "story_continuity_ledger", "quality_checks", "video_jobs", "content_revisions", "production_delivery"];
+  const required = ["series", "series_transfer", "story_continuity_ledger", "episode_outlines", "longform_novels", "shot_asset_links", "local_video_assembly", "local_subtitles", "assembly_presets", "local_visual_assets", "quality_checks", "story_quality_review", "scheduled_backups", "video_jobs", "content_revisions", "production_delivery"];
   const missing = required.filter((feature) => !status?.features?.includes(feature));
   const messages = [];
+  const clientVersion = document.querySelector('meta[name="client-bundle-version"]')?.content || "未知";
+  const diagnostics = document.querySelector("#system-diagnostics-details");
+  if (diagnostics) {
+    const startedAt = status?.server_started_at ? new Date(status.server_started_at).toLocaleString() : "未知";
+    const rows = [
+      ["页面资源", `v${clientVersion} · API ${EXPECTED_API_CONTRACT_VERSION}`],
+      ["服务版本", status ? `${status.app_version || "未知"} · API ${status.api_contract_version ?? "未知"}` : "无法连接"],
+      ["服务实例", status?.server_instance_id || "未知"],
+      ["启动时间", startedAt],
+      ["Python", status?.python_version || "未知"],
+      ["视频任务线程", status ? (status.video_job_worker_running ? "运行中" : "未运行") : "未知"],
+      ["功能标记", status ? `${(status.features || []).length} 项` : "未知"],
+    ];
+    diagnostics.innerHTML = rows.map(([label, value]) => `<dt>${escapeHTML(label)}</dt><dd>${escapeHTML(value)}</dd>`).join("");
+  }
   if (!status) messages.push("无法读取本地服务版本信息。");
   else if (status.api_contract_version !== EXPECTED_API_CONTRACT_VERSION || missing.length) {
     messages.push(`前后端接口版本不兼容（服务端 ${status.api_contract_version ?? "未知"}，页面需要 ${EXPECTED_API_CONTRACT_VERSION}）。`);
@@ -242,7 +263,8 @@ function showCompatibilityStatus(status) {
     return;
   }
   banner.hidden = false;
-  banner.textContent = `${messages.join(" ")} 请重启本地服务并硬刷新页面（⌘⇧R）；本地单用户模式不会因此开放公网访问。`;
+  banner.innerHTML = `${escapeHTML(messages.join(" "))} 请先重启本地服务，再刷新此页面；如确认服务已更新，可 <button class="compatibility-refresh" id="reload-page" type="button">重新加载页面</button>。本地单用户模式不会因此开放公网访问。`;
+  banner.querySelector("#reload-page")?.addEventListener("click", () => window.location.reload());
 }
 
 function showNotice(message, isError = false) {
@@ -512,6 +534,13 @@ function renderWorkflowSetup() {
           <label><span data-track-label="duration">视频时长（秒）</span><input name="duration_seconds" type="number" min="6" max="180" value="30" required /></label>
           <label><span data-track-label="style">整体风格</span><input name="style" value="真实、清晰、有记忆点" maxlength="300" /></label>
         </div>
+        <div class="form-row form-row-three assembly-setup-fields">
+          <label for="create-output-aspect-ratio">最终合成画幅<select id="create-output-aspect-ratio" name="output_aspect_ratio">
+            <option value="9:16" selected>9:16 · 竖屏</option><option value="16:9">16:9 · 横屏</option><option value="1:1">1:1 · 方形</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="2:3">2:3</option><option value="3:2">3:2</option><option value="21:9">21:9 · 宽银幕</option>
+          </select></label>
+          <label for="create-output-frame-mode">素材适配<select id="create-output-frame-mode" name="output_frame_mode"><option value="pad" selected>补边适配 · 保留完整画面</option><option value="crop">裁切填满 · 可能裁掉边缘</option></select></label>
+          <label for="create-output-preset">文件预设<select id="create-output-preset" name="output_preset"><option value="compact">紧凑 · 720p 上限</option><option value="standard" selected>标准 · 1080p 上限</option><option value="quality">高质量 · 1440p 上限</option></select></label>
+        </div>
         <section id="series-association" class="series-association" aria-labelledby="series-association-title" hidden>
           <h2 id="series-association-title">加入故事系列</h2>
           <div class="form-row">
@@ -608,6 +637,19 @@ function renderAssetVersions(asset = {}) {
   }).join("")}</ol></details>`;
 }
 
+function renderShotAssetAssignment(shot) {
+  if (!state.project?.series_id) return "";
+  const assets = Array.isArray(state.activeSeriesAssets) ? state.activeSeriesAssets : [];
+  const selected = new Set(Array.isArray(shot.asset_ids) ? shot.asset_ids : []);
+  return `<section class="shot-assignment" aria-label="系列资产关联">
+    <label for="shot-assets-${escapeHTML(shot.shot_id)}">本镜头引用的系列资产<select id="shot-assets-${escapeHTML(shot.shot_id)}" data-shot-assets="${escapeHTML(shot.shot_id)}" multiple size="${Math.min(Math.max(assets.length, 2), 5)}" aria-describedby="shot-assets-help-${escapeHTML(shot.shot_id)}">
+      ${assets.map((asset) => `<option value="${escapeHTML(asset.id)}" ${selected.has(asset.id) ? "selected" : ""}>${escapeHTML(asset.name)} · ${escapeHTML(seriesAssetKindLabel(asset.kind))}${asset.archived ? "（已归档，仅保留既有关联）" : ""}</option>`).join("")}
+    </select></label>
+    <small id="shot-assets-help-${escapeHTML(shot.shot_id)}">选中资产会作为该镜头的文字连续性参考；不会自动上传本地资产文件。</small>
+    <button class="button button-subtle" type="button" data-save-shot-assets="${escapeHTML(shot.shot_id)}" ${assets.length ? "" : "disabled"}>保存镜头资产关联</button>
+  </section>`;
+}
+
 function renderVideoShot(shot) {
   const image = shot.image || {};
   const video = shot.video || {};
@@ -628,6 +670,7 @@ function renderVideoShot(shot) {
     ${details ? `<p class="production-shot-description">${escapeHTML(details)}</p>` : ""}
     ${shot.stale ? `<p class="shot-stale-note" role="status">镜头任务已变化；过期素材仍保留供参考，需重新生成后再使用。</p>` : ""}
     ${shot.continuity ? `<p class="production-shot-continuity"><strong>连续性：</strong>${escapeHTML(shot.continuity)}</p>` : ""}
+    ${renderShotAssetAssignment(shot)}
     <details class="production-shot-prompts"><summary>查看生成提示词</summary><dl class="edit-plan-list">
       <div><dt>图片提示词</dt><dd>${escapeHTML(shot.image_prompt)}</dd></div><div><dt>视频提示词</dt><dd>${escapeHTML(shot.video_prompt)}</dd></div>
       ${shot.negative_prompt ? `<div><dt>避免项</dt><dd>${escapeHTML(shot.negative_prompt)}</dd></div>` : ""}</dl></details>
@@ -660,19 +703,137 @@ function renderVideoShot(shot) {
   </article>`;
 }
 
+function renderLocalAssembly(project, shots, video) {
+  const ids = shots.map((shot) => shot.shot_id);
+  const validOrder = (order) => Array.isArray(order) && order.length === ids.length && new Set(order).size === ids.length && ids.every((id) => order.includes(id));
+  if (state.renderOrderProjectId !== project.id || !validOrder(state.renderOrderDraft)) {
+    state.renderOrderProjectId = project.id;
+    const saved = video.render_order;
+    const suggested = video.edit_plan?.sequence;
+    state.renderOrderDraft = validOrder(saved) ? [...saved] : validOrder(suggested) ? [...suggested] : [...ids];
+  }
+  const order = state.renderOrderDraft;
+  const byId = new Map(shots.map((shot) => [shot.shot_id, shot]));
+  const needsSave = !validOrder(video.render_order) || order.some((id, index) => id !== video.render_order[index]);
+  const clipsReady = shots.every((shot) => shot.video?.status === "ready" && !shot.video?.stale_reason && !shot.stale && shot.video?.asset_url);
+  const busy = shots.some((shot) => ["queued", "submitting", "generating"].includes(shot.video?.status));
+  const finalVideo = video.final_video || {};
+  const finalUrl = finalVideo.asset_url ? safeMediaUrl(finalVideo.asset_url) : "";
+  const brief = project.brief || {};
+  const outputAspectRatio = brief.output_aspect_ratio || "9:16";
+  const outputFrameMode = brief.output_frame_mode || "pad";
+  const outputPreset = brief.output_preset || "standard";
+  const scenePlan = parseScenePlan(project.workflow?.scenes?.content || "");
+  const hasSubtitleText = Boolean(scenePlan?.shots?.some((shot) => shot.voiceover?.trim() || shot.screen_text?.trim()));
+  const aspectOptions = [["9:16", "9:16 · 竖屏"], ["16:9", "16:9 · 横屏"], ["1:1", "1:1 · 方形"], ["4:3", "4:3"], ["3:4", "3:4"], ["2:3", "2:3"], ["3:2", "3:2"], ["21:9", "21:9 · 宽银幕"]];
+  return `<section class="local-assembly-card" aria-labelledby="local-assembly-title">
+    <div class="scene-plan-heading"><div><p class="section-kicker">本机后期</p><h3 id="local-assembly-title">最终 MP4 合成</h3></div><span>${clipsReady ? "素材齐备" : `${shots.filter((shot) => shot.video?.status === "ready").length} / ${shots.length} 段可用`}</span></div>
+    <p>仅读取已保存的本地镜头视频；按项目画幅统一缩放并补边或裁切，使用选定的 MP4 预设后在本机合成。不会调用视频生成供应商，也不会覆盖原片段。</p>
+    <div class="assembly-settings-grid">
+      <label for="assembly-aspect-ratio">输出画幅<select id="assembly-aspect-ratio">${aspectOptions.map(([value, label]) => `<option value="${value}" ${outputAspectRatio === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+      <label for="assembly-frame-mode">素材适配<select id="assembly-frame-mode"><option value="pad" ${outputFrameMode === "pad" ? "selected" : ""}>补边适配 · 不裁切</option><option value="crop" ${outputFrameMode === "crop" ? "selected" : ""}>裁切填满 · 可能裁边</option></select></label>
+      <label for="assembly-preset">文件预设<select id="assembly-preset"><option value="compact" ${outputPreset === "compact" ? "selected" : ""}>紧凑 · 720p 上限</option><option value="standard" ${outputPreset === "standard" ? "selected" : ""}>标准 · 1080p 上限</option><option value="quality" ${outputPreset === "quality" ? "selected" : ""}>高质量 · 1440p 上限</option></select></label>
+    </div>
+    <div class="local-assembly-actions"><button class="button button-subtle" id="save-assembly-settings" type="button">保存合成设置</button></div>
+    ${hasSubtitleText ? `<div class="subtitle-downloads"><span>字幕文件（旁白 + 屏幕文字）</span><a class="button button-subtle" href="/api/projects/${encodeURIComponent(project.id)}/subtitles.srt">下载 SRT</a><a class="button button-subtle" href="/api/projects/${encodeURIComponent(project.id)}/subtitles.ass">下载 ASS</a></div>` : '<p class="assembly-subtitle-note">已确认镜头任务没有旁白或屏幕文字；补充后可下载字幕，合成时会自动烧录。</p>'}
+    <ol class="render-order-list">${order.map((shotId, index) => {
+      const shot = byId.get(shotId) || {};
+      return `<li><span class="render-order-number">${index + 1}</span><span class="render-order-name"><strong>${escapeHTML(shotId)}</strong><small>${escapeHTML(shot.purpose || shot.visual_description || "镜头")}</small></span>
+        <span class="render-order-actions"><button class="button button-subtle" type="button" data-order-move="up" data-order-shot="${escapeHTML(shotId)}" aria-label="将 ${escapeHTML(shotId)} 上移" ${index === 0 ? "disabled" : ""}>↑</button>
+        <button class="button button-subtle" type="button" data-order-move="down" data-order-shot="${escapeHTML(shotId)}" aria-label="将 ${escapeHTML(shotId)} 下移" ${index === order.length - 1 ? "disabled" : ""}>↓</button></span></li>`;
+    }).join("")}</ol>
+    <div class="local-assembly-actions"><button class="button button-subtle" id="save-render-order" type="button" ${needsSave ? "" : "disabled"}>保存镜头顺序</button>
+      <button class="button button-primary" id="assemble-final-video" type="button" ${!clipsReady || busy || needsSave ? "disabled" : ""}>本机合成最终 MP4</button></div>
+    ${finalVideo.status === "stale" ? `<p class="assembly-stale-note" role="status">${escapeHTML(finalVideo.stale_reason || "镜头素材或顺序已更改，请重新合成。")}</p>` : ""}
+    ${finalUrl ? `<div class="video-preview"><video controls preload="metadata" src="${finalUrl}" aria-label="本地合成的最终视频"></video><p>${finalVideo.status === "ready" ? `本机合成 · ${escapeHTML(finalVideo.width || "")} × ${escapeHTML(finalVideo.height || "")} · ${escapeHTML(finalVideo.output_aspect_ratio || "")} · ${escapeHTML(finalVideo.preset || "标准")} · ${escapeHTML(finalVideo.duration_seconds || "")} 秒 · ${finalVideo.subtitles_burned ? `已烧录 ${escapeHTML(finalVideo.subtitle_cue_count || 0)} 条字幕 · ` : "未烧录字幕 · "}SHA-256 ${escapeHTML(finalVideo.sha256 || "")}` : "保留的旧版合成结果，仅供参考，当前镜头尚未重新合成。"}</p></div>` : ""}
+  </section>`;
+}
+
 function renderVideoStage(project) {
   const video = project.workflow?.video || {};
   const shots = Array.isArray(video.shots) ? video.shots : [];
   if (!shots.length) {
     const legacyUrl = video.asset_url ? safeMediaUrl(video.asset_url) : "";
     return legacyUrl
-      ? `<div class="video-preview"><video controls preload="metadata" src="${legacyUrl}" aria-label="旧版单段视频"></video><p>这是旧版单段视频记录；新项目会按镜头保存片段和 AI 剪辑方案，不会在本地合并。</p></div>`
+      ? `<div class="video-preview"><video controls preload="metadata" src="${legacyUrl}" aria-label="旧版单段视频"></video><p>这是旧版单段视频记录，不属于本机逐镜合成结果。</p></div>`
       : `<div class="provider-placeholder"><span class="placeholder-icon" aria-hidden="true">▧</span><div><strong>暂无逐镜任务</strong><p>先完成并确认“镜头任务”，再逐镜生成关键帧和视频片段。旧项目没有结构化镜头任务时，不会自动把整份分镜误当成单镜提示词。</p></div></div>`;
   }
-  const completed = shots.filter((shot) => shot.video?.status === "ready").length;
+  const completed = shots.filter((shot) => shot.video?.status === "ready" && shot.video?.asset_url).length;
   return `<div class="video-production"><section class="edit-plan-card"><div class="scene-plan-heading"><div><p class="section-kicker">AI 剪辑方案</p><h3>镜头片段顺序与声音方向</h3></div><span>${completed} / ${shots.length} 段已生成</span></div>
-    ${renderEditPlan(video.edit_plan || {}) || '<p class="record-output-empty">暂无剪辑说明。</p>'}<p class="video-no-merge-note">交付为逐镜片段与剪辑方案，不会自动拼接成一个 MP4。</p></section>
-    <div class="production-shot-list">${shots.map(renderVideoShot).join("")}</div></div>`;
+    ${renderEditPlan(video.edit_plan || {}) || '<p class="record-output-empty">暂无剪辑说明。</p>'}<p class="video-no-merge-note">可在下方调整最终顺序，并使用本机 FFmpeg 合成；供应商仍只负责生成逐镜片段。</p></section>
+    ${renderLocalAssembly(project, shots, video)}<div class="production-shot-list">${shots.map(renderVideoShot).join("")}</div></div>`;
+}
+
+async function saveShotAssetAssignments(shotId) {
+  const select = workspace.querySelector(`[data-shot-assets="${CSS.escape(shotId)}"]`);
+  if (!select || !state.project) return;
+  const asset_ids = [...select.selectedOptions].map((option) => option.value);
+  try {
+    state.project = await api(`/api/projects/${encodeURIComponent(state.project.id)}/shots/${encodeURIComponent(shotId)}/assets`, {
+      method: "PUT", body: JSON.stringify({ asset_ids }),
+    });
+    showNotice("已保存镜头资产关联。后续生成会把所选系列资产作为文字连续性参考。", false);
+    renderProject();
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
+async function saveRenderOrder() {
+  if (!state.project) return;
+  try {
+    state.project = await api(`/api/projects/${encodeURIComponent(state.project.id)}/render-order`, {
+      method: "PUT", body: JSON.stringify({ shot_ids: state.renderOrderDraft }),
+    });
+    showNotice("已保存本地合成的镜头顺序。已有成片若使用旧顺序会标记为过期。", false);
+    renderProject();
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
+async function saveAssemblySettings() {
+  if (!state.project) return;
+  const payload = {
+    output_aspect_ratio: workspace.querySelector("#assembly-aspect-ratio")?.value || "9:16",
+    output_frame_mode: workspace.querySelector("#assembly-frame-mode")?.value || "pad",
+    output_preset: workspace.querySelector("#assembly-preset")?.value || "standard",
+  };
+  const button = workspace.querySelector("#save-assembly-settings");
+  if (button) { button.disabled = true; button.textContent = "正在保存…"; }
+  try {
+    state.project = await api(`/api/projects/${encodeURIComponent(state.project.id)}/assembly-settings`, {
+      method: "PUT", body: JSON.stringify(payload),
+    });
+    showNotice("本地合成画幅、补边 / 裁切方式和文件预设已保存；已有成片如受影响会标记为过期。", false);
+    renderProject();
+  } catch (error) {
+    showNotice(error.message, true);
+    if (button?.isConnected) { button.disabled = false; button.textContent = "保存合成设置"; }
+  }
+}
+
+async function assembleFinalVideo() {
+  if (!state.project) return;
+  const confirmed = await confirmInApp({
+    title: "在本机合成最终 MP4？",
+    message: "仅使用项目中已保存的本地镜头片段。会在本机运行 FFmpeg、创建一个新文件，不覆盖镜头，也不会调用媒体供应商。",
+    confirmLabel: "开始本机合成",
+  });
+  if (!confirmed) return;
+  const projectId = state.project.id;
+  const button = workspace.querySelector("#assemble-final-video");
+  if (button) { button.disabled = true; button.textContent = "正在本机合成…"; }
+  showNotice("正在本机合成视频；原始镜头片段不会修改。", false);
+  try {
+    state.project = await api(`/api/projects/${encodeURIComponent(projectId)}/assemble`, { method: "POST" });
+    await refreshProjects();
+    showNotice("本机合成完成。最终 MP4 已保存为新的本地媒体文件，仍需人工审核。", false);
+  } catch (error) {
+    showNotice(error.message, true);
+  } finally {
+    if (state.project?.id === projectId) renderProject();
+  }
 }
 
 function statusLabel(item, index, activeIndex) {
@@ -788,7 +949,7 @@ function renderProject() {
       ${viewStage === "script" ? `<div class="brief-strip"><strong>${project.track === "drama" ? "作品 / 项目名" : "产品 / 服务"}</strong><span>${escapeHTML(project.brief.product)}</span><strong>${project.track === "drama" ? "媒介 / 风格" : "风格"}</strong><span>${escapeHTML(project.brief.style)}</span></div>` : ""}
       <div class="stage-content">${contentArea}</div>
       ${editorContent && !isVideo ? '<div class="quality-check-bar"><button class="button button-subtle" id="run-quality-check" type="button">运行质量检查</button><div id="quality-results" class="quality-results" role="status" aria-live="polite"></div></div>' : ""}
-      <div class="stage-footer"><span class="footer-hint">${isVideo ? "媒体生成按镜头单独触发；费用以供应商实际返回为准，当前不在本地拼接视频。" : "已确认步骤可回退修改；后续内容会保留并标记为过期，重新审阅后再继续。"}</span>${action}</div>
+      <div class="stage-footer"><span class="footer-hint">${isVideo ? "镜头片段由供应商单独生成（可能产生费用）；最终 MP4 可在本机合成，不会调用媒体供应商。" : "已确认步骤可回退修改；后续内容会保留并标记为过期，重新审阅后再继续。"}</span>${action}</div>
     </section>
     <p class="workspace-footnote">文本模型：${escapeHTML(modelName(project.model))} <span aria-hidden="true">·</span> 本地技能：${state.skillCount ?? 0} 个</p>`;
 
@@ -854,6 +1015,21 @@ function renderProject() {
       }
     });
   });
+  workspace.querySelectorAll("[data-save-shot-assets]").forEach((button) => {
+    button.addEventListener("click", () => saveShotAssetAssignments(button.dataset.saveShotAssets));
+  });
+  workspace.querySelectorAll("[data-order-move]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = state.renderOrderDraft.indexOf(button.dataset.orderShot);
+      const target = index + (button.dataset.orderMove === "up" ? -1 : 1);
+      if (index < 0 || target < 0 || target >= state.renderOrderDraft.length) return;
+      [state.renderOrderDraft[index], state.renderOrderDraft[target]] = [state.renderOrderDraft[target], state.renderOrderDraft[index]];
+      renderProject();
+    });
+  });
+  workspace.querySelector("#save-render-order")?.addEventListener("click", saveRenderOrder);
+  workspace.querySelector("#save-assembly-settings")?.addEventListener("click", saveAssemblySettings);
+  workspace.querySelector("#assemble-final-video")?.addEventListener("click", assembleFinalVideo);
   document.querySelector("#approve-stage")?.addEventListener("click", approveStage);
   document.querySelector("#save-content")?.addEventListener("click", saveContent);
   scheduleVideoJobRefresh();
@@ -1335,19 +1511,73 @@ function renderSeriesAssetForm(asset = null) {
   const prefix = asset ? `asset-${asset.id}` : "new-series-asset";
   const value = (field) => escapeHTML(asset?.[field] || "");
   const kind = asset?.kind || "character";
+  const media = Array.isArray(asset?.media) ? asset.media : [];
+  const mediaGallery = media.length ? `<div class="series-asset-media-grid">${media.map((item) => {
+    const url = safeMediaUrl(item.asset_url);
+    return url ? `<figure><img src="${url}" alt="${escapeHTML(asset.name)}参考图：${escapeHTML(item.filename || "本地图片")}" loading="lazy" /><figcaption>${escapeHTML(item.filename || "本地图片")} · ${escapeHTML(Math.ceil((item.size || 0) / 1024))} KB</figcaption></figure>` : "";
+  }).join("")}</div>` : '<p class="series-form-hint">尚未上传本地参考图。</p>';
   return `<form class="series-form series-asset-form" ${asset ? `data-series-asset-form="${escapeHTML(asset.id)}"` : 'id="new-series-asset-form"'}>
     <div class="form-row"><label for="${prefix}-kind">资产类型<select id="${prefix}-kind" name="kind"><option value="character" ${kind === "character" ? "selected" : ""}>人物</option><option value="location" ${kind === "location" ? "selected" : ""}>场景</option><option value="prop" ${kind === "prop" ? "selected" : ""}>道具</option></select></label>
       <label for="${prefix}-name">名称<input id="${prefix}-name" name="name" required maxlength="120" value="${value("name")}" /></label></div>
     <label for="${prefix}-description">设定<textarea id="${prefix}-description" name="description" maxlength="3000" rows="2">${value("description")}</textarea></label>
     <label for="${prefix}-visual">视觉提示<textarea id="${prefix}-visual" name="visual_prompt" maxlength="3000" rows="2" placeholder="用于跨集保持外观、色彩或构图一致">${value("visual_prompt")}</textarea></label>
     <label for="${prefix}-continuity">连续性备注<textarea id="${prefix}-continuity" name="continuity_notes" maxlength="3000" rows="2" placeholder="例如：右手腕始终佩戴旧表">${value("continuity_notes")}</textarea></label>
+    ${asset ? `<section class="series-asset-media" aria-label="本地参考图"><h3>本地参考图</h3>${mediaGallery}<label for="${prefix}-media-files">添加图片 <small>PNG / JPEG / WebP，单张不超过 20 MiB，每项最多 8 张</small><input id="${prefix}-media-files" type="file" accept="image/png,image/jpeg,image/webp" multiple ${asset.archived ? "disabled" : ""} /></label><button class="button button-subtle" type="button" data-upload-series-asset-media="${escapeHTML(asset.id)}" ${asset.archived ? "disabled" : ""}>上传选中的图片</button><p class="series-form-status" data-asset-media-status="${escapeHTML(asset.id)}" role="status" aria-live="polite"></p></section>` : '<p class="series-form-hint">保存资产后，可为其添加本地参考图。</p>'}
     ${asset ? `<label class="series-archive-toggle"><input type="checkbox" name="archived" ${asset.archived ? "checked" : ""} />归档此资产（保留已有分集）</label>` : ""}
     <p class="series-form-status" role="status" aria-live="polite"></p>
     <div class="series-form-actions"><button class="button button-primary" type="submit">${asset ? "保存资产" : "添加资产"}</button></div>
   </form>`;
 }
 
+function renderEpisodeOutlineCard(episode) {
+  const outline = episode.episode_outline || {};
+  const status = outline.status === "approved" ? "作者已确认" : outline.content ? "草稿 · 待审核" : "尚未创建";
+  const revisions = Array.isArray(outline.revisions) ? outline.revisions : [];
+  return `<details class="episode-outline-card"><summary>可选分集大纲 · ${status}</summary>
+    <p>大纲不是新的工作流阶段；生成后可修改，只有点击“确认大纲”后才会作为脚本参考。</p>
+    <label for="episode-outline-${escapeHTML(episode.id)}">分集大纲<textarea id="episode-outline-${escapeHTML(episode.id)}" data-episode-outline-content="${escapeHTML(episode.id)}" maxlength="12000" rows="6" placeholder="可以先生成，也可以直接写入自己的分集规划">${escapeHTML(outline.content || "")}</textarea></label>
+    <div class="episode-outline-actions"><button class="button button-subtle" type="button" data-episode-outline-generate="${escapeHTML(episode.id)}">生成 / 重生成草稿</button>
+      <button class="button button-subtle" type="button" data-episode-outline-save="draft" data-episode-id="${escapeHTML(episode.id)}">保存为草稿</button>
+      <button class="button button-primary" type="button" data-episode-outline-save="approved" data-episode-id="${escapeHTML(episode.id)}">确认大纲</button></div>
+    ${revisions.length ? `<details class="episode-outline-history"><summary>历史版本（${revisions.length}）</summary><ol>${[...revisions].reverse().map((revision) => `<li><small>${escapeHTML(recordDate(revision.archived_at))} · ${escapeHTML(revision.reason || "旧版")}</small><p>${escapeHTML(revision.content || "")}</p></li>`).join("")}</ol></details>` : ""}
+  </details>`;
+}
+
+async function generateEpisodeOutline(projectId) {
+  const confirmed = await confirmInApp({
+    title: "生成分集大纲草稿？",
+    message: "将使用当前系列设定、已确认连续性和此前已确认剧本调用所选文本模型。生成内容不会自动视为既定剧情。",
+    confirmLabel: "生成大纲草稿",
+  });
+  if (!confirmed) return;
+  try {
+    await api(`/api/projects/${encodeURIComponent(projectId)}/episode-outline/generate`, {
+      method: "POST", body: JSON.stringify({ model: state.selectedModel || state.config?.default_model }),
+    });
+    if (state.currentSeriesId) await openSeriesDetail(state.currentSeriesId);
+    showNotice("分集大纲草稿已生成；请编辑并显式确认后，再用于脚本创作。", false);
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
+async function saveEpisodeOutline(projectId, status) {
+  const textarea = workspace.querySelector(`[data-episode-outline-content="${CSS.escape(projectId)}"]`);
+  if (!textarea) return;
+  try {
+    await api(`/api/projects/${encodeURIComponent(projectId)}/episode-outline`, {
+      method: "PUT", body: JSON.stringify({ content: textarea.value, status }),
+    });
+    const seriesId = state.currentSeriesId;
+    if (seriesId) await openSeriesDetail(seriesId);
+    showNotice(status === "approved" ? "分集大纲已确认，可作为本集剧本参考。" : "分集大纲草稿已保存。", false);
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
 function renderSeriesDetail(series) {
+  state.currentSeriesId = series.id;
   state.viewMode = "series-detail";
   workspace.classList.remove("chat-workspace");
   document.querySelector("#top-title").textContent = series.title;
@@ -1392,7 +1622,7 @@ function renderSeriesDetail(series) {
           </form>
         </section>
         <section class="series-panel" aria-labelledby="series-episodes-title"><div class="series-panel-heading"><div><h2 id="series-episodes-title">分集</h2><p>${episodes.length} 集，按集数排序</p></div></div>
-          ${episodes.length ? `<ol class="series-episode-list">${episodes.map((episode) => `<li><button type="button" data-open-episode="${escapeHTML(episode.id)}"><span>EP${String(episode.episode_number || 0).padStart(2, "0")}</span><strong>${escapeHTML(episode.title)}</strong></button><small>${escapeHTML(stageLabel(episode.active_stage))}${episode.archived ? " · 已从最近对话移除" : ""}</small></li>`).join("")}</ol>` : '<p class="series-panel-empty">系列还没有分集。新建分集后可逐步确认脚本、视觉设定与镜头任务。</p>'}
+          ${episodes.length ? `<ol class="series-episode-list">${episodes.map((episode) => `<li><button type="button" data-open-episode="${escapeHTML(episode.id)}"><span>EP${String(episode.episode_number || 0).padStart(2, "0")}</span><strong>${escapeHTML(episode.title)}</strong></button><small>${escapeHTML(stageLabel(episode.active_stage))}${episode.archived ? " · 已从最近对话移除" : ""}</small>${renderEpisodeOutlineCard(episode)}</li>`).join("")}</ol>` : '<p class="series-panel-empty">系列还没有分集。新建分集后可逐步确认脚本、视觉设定与镜头任务。</p>'}
         </section>
       </div>
       <section class="series-panel continuity-panel" aria-labelledby="series-continuity-title">
@@ -1433,6 +1663,12 @@ function renderSeriesDetail(series) {
     document.querySelector("#project-track").value = "drama";
     updateWorkflowTrackCopy("drama");
     document.querySelector("#series-select").value = series.id;
+  });
+  workspace.querySelectorAll("[data-episode-outline-generate]").forEach((button) => {
+    button.addEventListener("click", () => generateEpisodeOutline(button.dataset.episodeOutlineGenerate));
+  });
+  workspace.querySelectorAll("[data-episode-outline-save]").forEach((button) => {
+    button.addEventListener("click", () => saveEpisodeOutline(button.dataset.episodeId, button.dataset.episodeOutlineSave));
   });
   workspace.querySelector("#series-update-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1535,9 +1771,45 @@ function renderSeriesDetail(series) {
       }
     });
   });
+  workspace.querySelectorAll("[data-upload-series-asset-media]").forEach((button) => {
+    button.addEventListener("click", () => uploadSeriesAssetMedia(series.id, button.dataset.uploadSeriesAssetMedia, button));
+  });
   workspace.querySelectorAll("[data-open-episode]").forEach((button) => {
     button.addEventListener("click", () => openProductionRecord(button.dataset.openEpisode));
   });
+}
+
+async function uploadSeriesAssetMedia(seriesId, assetId, button) {
+  const form = button.closest("form");
+  const input = form?.querySelector('input[type="file"]');
+  const files = Array.from(input?.files || []);
+  const status = form?.querySelector(`[data-asset-media-status="${CSS.escape(assetId)}"]`);
+  if (!files.length) {
+    if (status) status.textContent = "请先选择一张或多张图片。";
+    return;
+  }
+  if (files.length > 8) {
+    if (status) status.textContent = "每次最多选择 8 张图片。";
+    return;
+  }
+  const formData = new FormData();
+  for (const file of files) formData.append("files", file, file.name);
+  button.disabled = true;
+  if (status) status.textContent = "正在上传并校验本地图片…";
+  try {
+    const response = await fetch(`/api/series/${encodeURIComponent(seriesId)}/assets/${encodeURIComponent(assetId)}/media`, {
+      method: "POST", body: formData, credentials: "same-origin",
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.detail || `上传失败（HTTP ${response.status}）`);
+    if (input) input.value = "";
+    await refreshSeries();
+    await openSeriesDetail(seriesId);
+    showNotice("本地参考图已关联到系列资产；图片不会自动发送给生成供应商。", false);
+  } catch (error) {
+    if (status?.isConnected) status.textContent = error.message;
+    if (button.isConnected) button.disabled = false;
+  }
 }
 
 async function refreshProjects() {
@@ -1605,10 +1877,233 @@ async function archiveProject(projectId) {
   }
 }
 
+async function showNovelLibrary() {
+  try {
+    state.novels = await api("/api/novels");
+    renderNovelLibrary();
+    renderProjects();
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
+function renderNovelLibrary() {
+  state.viewMode = "novel-library";
+  workspace.classList.remove("chat-workspace");
+  document.querySelector("#top-title").textContent = "长篇作品";
+  const viewToggle = document.querySelector("#view-toggle");
+  viewToggle.hidden = true;
+  viewToggle.disabled = true;
+  syncModelControl();
+  workspace.innerHTML = `<section class="novel-screen">
+    <header class="series-heading"><div><p class="section-kicker">长篇写作 · 故事圣经与章节</p><h1>长篇作品</h1><p>先维护故事圣经，再按章节独立撰写、确认和修订。只有较早且已确认的章节正文会被用作后续生成参考。</p></div>
+      <button class="button button-primary" id="show-novel-create" type="button">新建作品</button></header>
+    <form id="novel-create-form" class="series-form novel-create-form" hidden>
+      <h2>建立长篇作品</h2><label for="novel-create-title">作品名称<input id="novel-create-title" name="title" required maxlength="120" /></label>
+      <label for="novel-create-logline">一句话梗概<textarea id="novel-create-logline" name="logline" maxlength="3000" rows="2"></textarea></label>
+      <p class="series-form-status" role="status" aria-live="polite"></p><div class="series-form-actions"><button class="button button-subtle" id="cancel-novel-create" type="button">取消</button><button class="button button-primary" type="submit">创建作品</button></div>
+    </form>
+    ${state.novels.length ? `<div class="novel-list">${state.novels.map((novel) => `<article class="novel-list-row"><div><h2>${escapeHTML(novel.title)}</h2><p>${escapeHTML(novel.logline || "尚未填写梗概。")}</p><small>${novel.chapter_count} 章 · ${novel.approved_chapter_count} 章已确认</small></div><button class="button button-subtle" type="button" data-open-novel="${escapeHTML(novel.id)}">打开作品</button></article>`).join("")}</div>` : `<div class="series-empty"><span class="series-empty-mark" aria-hidden="true">▤</span><h2>还没有长篇作品</h2><p>建立作品后，可以集中维护人物、世界规则、主题和计划结局，再逐章规划与写作。</p><button class="button button-subtle" id="novel-empty-create" type="button">建立第一个作品</button></div>`}
+  </section>`;
+  const form = workspace.querySelector("#novel-create-form");
+  const showCreate = () => { form.hidden = false; workspace.querySelector("#novel-create-title")?.focus(); };
+  workspace.querySelector("#show-novel-create").addEventListener("click", showCreate);
+  workspace.querySelector("#novel-empty-create")?.addEventListener("click", showCreate);
+  workspace.querySelector("#cancel-novel-create").addEventListener("click", () => { form.hidden = true; });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = form.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+      const created = await api("/api/novels", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(form).entries())) });
+      state.novels = await api("/api/novels");
+      await openNovelDetail(created.id);
+      showNotice("长篇作品已创建。", false);
+    } catch (error) {
+      form.querySelector(".series-form-status").textContent = error.message;
+      submit.disabled = false;
+    }
+  });
+  workspace.querySelectorAll("[data-open-novel]").forEach((button) => {
+    button.addEventListener("click", () => openNovelDetail(button.dataset.openNovel));
+  });
+}
+
+async function openNovelDetail(novelId) {
+  try {
+    const novel = await api(`/api/novels/${encodeURIComponent(novelId)}`);
+    renderNovelDetail(novel);
+    renderProjects();
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
+function novelChapterStatus(status) {
+  return ({ planning: "规划中", draft: "草稿 · 待确认", approved: "作者已确认", stale: "前文有变更 · 待复核" })[status] || status || "规划中";
+}
+
+function renderNovelDetail(novel) {
+  state.activeNovel = novel;
+  state.activeNovelId = novel.id;
+  state.viewMode = "novel-detail";
+  workspace.classList.remove("chat-workspace");
+  document.querySelector("#top-title").textContent = novel.title;
+  const viewToggle = document.querySelector("#view-toggle");
+  viewToggle.hidden = true;
+  viewToggle.disabled = true;
+  syncModelControl();
+  const fields = [
+    ["title", "作品名称", "input", 120], ["logline", "一句话梗概", "textarea", 3000],
+    ["genre", "题材", "input", 300], ["world_setting", "世界与规则", "textarea", 5000],
+    ["central_theme", "核心主题", "textarea", 2000], ["protagonist", "主角设定", "textarea", 3000],
+    ["character_arcs", "主要人物弧光", "textarea", 5000], ["ending", "计划结局", "textarea", 3000],
+    ["tone", "叙事基调", "input", 1000], ["content_boundaries", "内容边界", "textarea", 2000],
+  ];
+  const nextNumber = Math.max(0, ...novel.chapters.map((chapter) => Number(chapter.chapter_number) || 0)) + 1;
+  workspace.innerHTML = `<section class="novel-screen novel-detail-screen">
+    <div class="series-detail-nav"><button class="record-back-button" id="back-to-novel-library" type="button">← 返回长篇作品</button></div>
+    <header class="series-heading"><div><p class="section-kicker">长篇故事圣经</p><h1>${escapeHTML(novel.title)}</h1><p>${escapeHTML(novel.logline || "尚未填写梗概。")}</p></div></header>
+    <section class="series-panel novel-bible-panel"><h2>故事圣经</h2><p class="novel-guidance">修改故事圣经不会覆盖章节正文；后续生成会按需参考本设定和已确认的前文。</p>
+      <form id="novel-bible-form" class="series-form novel-bible-form">${fields.map(([field, label, type, max]) => `<label for="novel-${field}">${label}${type === "input" ? `<input id="novel-${field}" name="${field}" maxlength="${max}" ${field === "title" ? "required" : ""} value="${escapeHTML(novel[field] || "")}" />` : `<textarea id="novel-${field}" name="${field}" maxlength="${max}" rows="${field === "world_setting" || field === "character_arcs" ? 4 : 3}">${escapeHTML(novel[field] || "")}</textarea>`}</label>`).join("")}
+        <p class="series-form-status" role="status" aria-live="polite"></p><div class="series-form-actions"><button class="button button-primary" type="submit">保存故事圣经</button></div>
+      </form>
+    </section>
+    <section class="series-panel novel-chapters-panel"><div class="series-panel-heading"><div><h2>章节</h2><p>${novel.chapters.length} 章 · 仅较早且已确认的正文会作为后续生成参考</p></div></div>
+      <form id="novel-chapter-create" class="series-form novel-chapter-create"><h3>添加章节</h3><div class="form-row"><label for="new-chapter-number">章节编号<input id="new-chapter-number" name="chapter_number" type="number" min="1" max="9999" value="${nextNumber}" required /></label><label for="new-chapter-title">章节标题<input id="new-chapter-title" name="title" maxlength="160" required /></label></div>
+        <label for="new-chapter-outline">初始大纲（可选）<textarea id="new-chapter-outline" name="outline" maxlength="12000" rows="3"></textarea></label><p class="series-form-status" role="status" aria-live="polite"></p><div class="series-form-actions"><button class="button button-primary" type="submit">添加章节</button></div></form>
+      ${novel.chapters.length ? `<div class="novel-chapter-list">${novel.chapters.map((chapter) => `<article class="novel-chapter-card" data-novel-chapter="${escapeHTML(chapter.id)}">
+        <header><div><p class="section-kicker">第 ${escapeHTML(chapter.chapter_number)} 章 · ${escapeHTML(novelChapterStatus(chapter.status))}</p><h3>${escapeHTML(chapter.title)}</h3>${chapter.stale_reason ? `<p class="novel-stale-note">${escapeHTML(chapter.stale_reason)}</p>` : ""}</div></header>
+        <label for="chapter-title-${escapeHTML(chapter.id)}">章节标题<input id="chapter-title-${escapeHTML(chapter.id)}" data-novel-title value="${escapeHTML(chapter.title)}" maxlength="160" /></label>
+        <label for="chapter-outline-${escapeHTML(chapter.id)}">章节大纲<textarea id="chapter-outline-${escapeHTML(chapter.id)}" data-novel-outline maxlength="12000" rows="4">${escapeHTML(chapter.outline || "")}</textarea></label>
+        <label for="chapter-content-${escapeHTML(chapter.id)}">章节正文<textarea id="chapter-content-${escapeHTML(chapter.id)}" data-novel-content maxlength="100000" rows="16">${escapeHTML(chapter.content || "")}</textarea></label>
+        <div class="novel-chapter-actions"><button class="button button-subtle" type="button" data-save-novel-chapter="${escapeHTML(chapter.id)}">保存章节</button><button class="button button-subtle" type="button" data-generate-novel="outline" data-chapter-id="${escapeHTML(chapter.id)}">生成大纲草稿</button><button class="button button-subtle" type="button" data-generate-novel="chapter" data-chapter-id="${escapeHTML(chapter.id)}">生成 / 重生成正文</button><button class="button button-primary" type="button" data-approve-novel-chapter="${escapeHTML(chapter.id)}">确认章节</button></div>
+        ${(chapter.revisions || []).length ? `<details class="novel-revisions"><summary>历史版本（${chapter.revisions.length}）</summary><ol>${[...chapter.revisions].reverse().map((revision) => `<li><small>${escapeHTML(recordDate(revision.archived_at))} · ${escapeHTML(revision.reason || "旧版")}</small><p>${escapeHTML(revision.title || "")} · ${escapeHTML(novelChapterStatus(revision.status))}</p><button class="button button-subtle" type="button" data-load-novel-revision="${escapeHTML(revision.revision_id)}" data-chapter-id="${escapeHTML(chapter.id)}">载入历史版本到编辑区</button></li>`).join("")}</ol></details>` : ""}
+      </article>`).join("")}</div>` : '<p class="series-panel-empty">还没有章节。先添加章节编号和标题，再填写或生成大纲、正文。</p>'}
+    </section>
+  </section>`;
+  workspace.querySelector("#back-to-novel-library").addEventListener("click", showNovelLibrary);
+  workspace.querySelector("#novel-bible-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const submit = form.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+      await api(`/api/novels/${encodeURIComponent(novel.id)}`, { method: "PUT", body: JSON.stringify(Object.fromEntries(new FormData(form).entries())) });
+      state.novels = await api("/api/novels");
+      await openNovelDetail(novel.id);
+      showNotice("故事圣经已保存；现有章节不会被覆盖。", false);
+    } catch (error) {
+      form.querySelector(".series-form-status").textContent = error.message;
+      submit.disabled = false;
+    }
+  });
+  workspace.querySelector("#novel-chapter-create").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const payload = Object.fromEntries(new FormData(form).entries());
+    payload.chapter_number = Number(payload.chapter_number);
+    const submit = form.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+      await api(`/api/novels/${encodeURIComponent(novel.id)}/chapters`, { method: "POST", body: JSON.stringify(payload) });
+      await openNovelDetail(novel.id);
+      showNotice("章节已添加。", false);
+    } catch (error) {
+      form.querySelector(".series-form-status").textContent = error.message;
+      submit.disabled = false;
+    }
+  });
+  workspace.querySelectorAll("[data-save-novel-chapter]").forEach((button) => button.addEventListener("click", () => saveNovelChapter(button.dataset.saveNovelChapter)));
+  workspace.querySelectorAll("[data-generate-novel]").forEach((button) => button.addEventListener("click", () => generateNovelChapter(button.dataset.chapterId, button.dataset.generateNovel)));
+  workspace.querySelectorAll("[data-approve-novel-chapter]").forEach((button) => button.addEventListener("click", () => approveNovelChapter(button.dataset.approveNovelChapter)));
+  workspace.querySelectorAll("[data-load-novel-revision]").forEach((button) => button.addEventListener("click", () => loadNovelRevision(button.dataset.chapterId, button.dataset.loadNovelRevision)));
+}
+
+async function saveNovelChapter(chapterId) {
+  const card = workspace.querySelector(`[data-novel-chapter="${CSS.escape(chapterId)}"]`);
+  if (!card || !state.activeNovel) return;
+  const payload = {
+    title: card.querySelector("[data-novel-title]").value,
+    outline: card.querySelector("[data-novel-outline]").value,
+    content: card.querySelector("[data-novel-content]").value,
+  };
+  try {
+    await api(`/api/novels/${encodeURIComponent(state.activeNovel.id)}/chapters/${encodeURIComponent(chapterId)}`, { method: "PUT", body: JSON.stringify(payload) });
+    await openNovelDetail(state.activeNovel.id);
+    showNotice("章节已保存。", false);
+    return true;
+  } catch (error) {
+    showNotice(error.message, true);
+    return false;
+  }
+}
+
+async function generateNovelChapter(chapterId, kind) {
+  if (!state.activeNovel) return;
+  const label = kind === "outline" ? "章节大纲" : "章节正文";
+  const confirmed = await confirmInApp({
+    title: `生成${label}草稿？`,
+    message: `将使用当前故事圣经、章节信息和较早的已确认正文调用所选文本模型。生成会归档旧版本，不会自动确认；模型使用可能产生费用。`,
+    confirmLabel: `生成${label}`,
+  });
+  if (!confirmed) return;
+  const novelId = state.activeNovel.id;
+  if (!await saveNovelChapter(chapterId)) return;
+  try {
+    await api(`/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(chapterId)}/generate`, {
+      method: "POST", body: JSON.stringify({ kind, model: state.selectedModel || state.config?.default_model }),
+    });
+    await openNovelDetail(novelId);
+    showNotice(`${label}草稿已生成，尚未确认。`, false);
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
+async function approveNovelChapter(chapterId) {
+  if (!state.activeNovel) return;
+  const confirmed = await confirmInApp({
+    title: "确认本章正文？",
+    message: "确认前会先保存当前编辑。确认后，该章节正文可能作为编号更大的后续章节的连续性参考。",
+    confirmLabel: "确认章节",
+  });
+  if (!confirmed) return;
+  const novelId = state.activeNovel.id;
+  if (!await saveNovelChapter(chapterId)) return;
+  try {
+    await api(`/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(chapterId)}/approve`, { method: "POST" });
+    await openNovelDetail(novelId);
+    showNotice("本章已确认；后续生成仅会引用较早的已确认章节。", false);
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+}
+
+function loadNovelRevision(chapterId, revisionId) {
+  const chapter = state.activeNovel?.chapters?.find((item) => item.id === chapterId);
+  const revision = chapter?.revisions?.find((item) => item.revision_id === revisionId);
+  const card = workspace.querySelector(`[data-novel-chapter="${CSS.escape(chapterId)}"]`);
+  if (!revision || !card) return;
+  card.querySelector("[data-novel-title]").value = revision.title || "";
+  card.querySelector("[data-novel-outline]").value = revision.outline || "";
+  card.querySelector("[data-novel-content]").value = revision.content || "";
+  showNotice("历史章节已载入编辑区；保存后才会替换当前内容。", false);
+}
+
 async function openProject(projectId) {
   try {
     if (state.project?.id !== projectId) clearPendingUploads();
     state.project = await api(`/api/projects/${encodeURIComponent(projectId)}`);
+    state.activeSeriesAssets = [];
+    if (state.project.series_id) {
+      try {
+        const linkedSeries = await api(`/api/series/${encodeURIComponent(state.project.series_id)}`);
+        state.activeSeriesAssets = Array.isArray(linkedSeries.assets) ? linkedSeries.assets : [];
+      } catch (error) {
+        console.warn("Unable to load linked series assets", error);
+      }
+    }
     state.viewStage = state.project.active_stage;
     showNotice("");
     renderProjects();
@@ -1635,6 +2130,11 @@ async function createProject(event) {
   }
   try {
     state.project = await api("/api/projects", { method: "POST", body: JSON.stringify(payload) });
+    state.activeSeriesAssets = [];
+    if (state.project.series_id) {
+      const linkedSeries = await api(`/api/series/${encodeURIComponent(state.project.series_id)}`);
+      state.activeSeriesAssets = Array.isArray(linkedSeries.assets) ? linkedSeries.assets : [];
+    }
     state.selectedSeriesId = null;
     state.viewStage = state.project.active_stage;
     showNotice("");
@@ -1796,9 +2296,13 @@ async function runStageQualityCheck() {
     const report = await api(`/api/projects/${encodeURIComponent(state.project.id)}/quality/${encodeURIComponent(state.viewStage)}`, { method: "POST" });
     if (!results) return;
     const findings = Array.isArray(report.findings) ? report.findings : [];
+    const narrative = report.narrative_review;
+    const narrativeMarkup = narrative?.dimensions?.length
+      ? `<section class="narrative-review"><strong>叙事结构线索 · 启发式</strong><ul>${narrative.dimensions.map((item) => `<li class="narrative-${escapeHTML(item.status)}"><strong>${escapeHTML(item.label)}</strong>：${item.status === "signal_found" ? `检出信号${item.evidence ? `（${escapeHTML(item.evidence)}）` : ""}` : "未检出明显信号；请人工确认"}</li>`).join("")}</ul><p>${escapeHTML(narrative.note || "检出信号不代表叙事有效，未检出也不代表缺失。")}</p></section>`
+      : "";
     results.innerHTML = `<strong>${escapeHTML(report.grade)} · ${escapeHTML(report.score)}/100 · 仅供参考</strong>${findings.length
       ? `<ul>${findings.map((finding) => `<li class="is-${escapeHTML(finding.severity)}"><strong>${escapeHTML(finding.title)}</strong>：${escapeHTML(finding.message)}</li>`).join("")}</ul>`
-      : "<p>未发现明显的格式或占位问题，请继续人工审阅内容质量。</p>"}`;
+      : "<p>未发现明显的格式或占位问题，请继续人工审阅内容质量。</p>"}${narrativeMarkup}`;
   } catch (error) {
     if (results) results.textContent = error.message;
   } finally {
@@ -2658,8 +3162,8 @@ function announceBackupExport() {
 async function initialize() {
   try {
     let compatibility;
-    [state.config, state.projects, state.skills, state.series, compatibility] = await Promise.all([
-      api("/api/config"), api("/api/projects"), api("/api/skills"), api("/api/series"),
+    [state.config, state.projects, state.skills, state.series, state.novels, compatibility] = await Promise.all([
+      api("/api/config"), api("/api/projects"), api("/api/skills"), api("/api/series"), api("/api/novels"),
       api("/api/system/status").catch(() => null),
     ]);
     showCompatibilityStatus(compatibility);
@@ -2712,7 +3216,9 @@ async function initialize() {
     document.querySelector("#rename-cancel").addEventListener("click", () => renameDialog.close());
     document.querySelector("#open-records")?.addEventListener("click", showProductionRecords);
     document.querySelector("#open-series")?.addEventListener("click", showSeriesLibrary);
+    document.querySelector("#open-novels")?.addEventListener("click", showNovelLibrary);
     document.querySelector("#new-project").addEventListener("click", () => {
+      state.activeSeriesAssets = [];
       state.selectedSeriesId = null;
       clearPendingUploads();
       state.project = null;
@@ -2727,6 +3233,7 @@ async function initialize() {
       document.querySelector("#chat-input")?.focus();
     });
     document.querySelector("#new-workflow").addEventListener("click", () => {
+      state.activeSeriesAssets = [];
       state.selectedSeriesId = null;
       clearPendingUploads();
       showNotice("");

@@ -133,6 +133,7 @@ def new_shot_record(shot: dict[str, Any]) -> dict[str, Any]:
     }
     return {
         **shot,
+        "asset_ids": [],
         "image": dict(empty_asset),
         "video": dict(empty_asset),
     }

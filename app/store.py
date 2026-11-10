@@ -60,6 +60,15 @@ class ProjectStore:
                 )"""
             )
             connection.execute(
+                """CREATE TABLE IF NOT EXISTS novels (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+
                 """CREATE TABLE IF NOT EXISTS series_assets (
                     id TEXT PRIMARY KEY,
                     series_id TEXT NOT NULL,
@@ -165,6 +174,19 @@ class ProjectStore:
         with self._connection() as connection:
             self._save_project_record(connection, project)
         return project
+
+    def save_if_updated_at(self, project: dict[str, Any], expected_updated_at: str) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE projects SET updated_at = ?, payload = ? WHERE id = ? AND updated_at = ?",
+                (
+                    project["updated_at"],
+                    json.dumps(project, ensure_ascii=False),
+                    project["id"],
+                    expected_updated_at,
+                ),
+            )
+        return cursor.rowcount == 1
 
     def import_project_bundle(
         self,
@@ -278,6 +300,27 @@ class ProjectStore:
     def list_series(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute("SELECT payload FROM series ORDER BY updated_at DESC, id").fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def save_novel(self, novel: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT INTO novels (id, created_at, updated_at, payload)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     updated_at = excluded.updated_at, payload = excluded.payload""",
+                (novel["id"], novel["created_at"], novel["updated_at"], json.dumps(novel, ensure_ascii=False)),
+            )
+        return novel
+
+    def get_novel(self, novel_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT payload FROM novels WHERE id = ?", (novel_id,)).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def list_novels(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute("SELECT payload FROM novels ORDER BY updated_at DESC, id").fetchall()
         return [json.loads(row["payload"]) for row in rows]
 
     def save_series_asset(self, asset: dict[str, Any]) -> dict[str, Any]:

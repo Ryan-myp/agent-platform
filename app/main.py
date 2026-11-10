@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
 import queue
 import re
 import shutil
+import sys
 import tempfile
 import threading
 from contextlib import asynccontextmanager
@@ -14,11 +16,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
@@ -28,10 +31,19 @@ from app.models import (
     ChatSessionCreate,
     ContentUpdate,
     GenerateRequest,
+    EpisodeOutlineUpdate,
+    ShotAssetsUpdate,
+    RenderOrderUpdate,
+    NovelCreate,
+    NovelUpdate,
+    NovelChapterCreate,
+    NovelChapterUpdate,
+    NovelChapterGenerateRequest,
     ModelCatalogUpdate,
     ModelUpdate,
     ProjectCreate,
     ProjectTitleUpdate,
+    AssemblySettingsUpdate,
     SeriesAssetCreate,
     SeriesAssetUpdate,
     SeriesCreate,
@@ -58,11 +70,13 @@ from app.services.project_transfer import ProjectTransferError, ProjectTransferS
 from app.services.quality import QualityService
 from app.services.delivery import DeliveryPackageError, DeliveryService
 from app.services.series_transfer import SeriesTransferService
+from app.services.novels import NovelError, NovelService
+from app.services.video_assembly import VideoAssemblyError, VideoAssemblyService
 from app.skills.loader import SkillLoader
 from app.store import ProjectStore
 
 ROOT = Path(__file__).resolve().parent.parent
-API_CONTRACT_VERSION = 3
+API_CONTRACT_VERSION = 5
 _SECRET_PARAM_NAMES = {"api_key", "apikey", "authorization", "access_token", "refresh_token", "secret"}
 
 
@@ -202,9 +216,16 @@ def create_app(
     delivery = DeliveryService(store, assets)
     quality = QualityService(store)
     series_transfer = SeriesTransferService(store, project_transfer)
+    novels = NovelService(store, current_settings, usage)
+    video_assembly = VideoAssemblyService(store, assets)
+
+    server_started_at: str | None = datetime.now(timezone.utc).isoformat()
+    server_instance_id = uuid4().hex[:12]
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        nonlocal server_started_at
+        server_started_at = datetime.now(timezone.utc).isoformat()
         video_job_worker.start()
         try:
             yield
@@ -227,6 +248,8 @@ def create_app(
     application.state.delivery = delivery
     application.state.quality = quality
     application.state.series_transfer = series_transfer
+    application.state.novels = novels
+    application.state.video_assembly = video_assembly
     application.state.model_credentials = credential_store
     application.state.video_job_worker = video_job_worker
     catalog_update_lock = threading.Lock()
@@ -269,7 +292,7 @@ def create_app(
     def run(action, *args: Any, **kwargs: Any):
         try:
             return action(*args, **kwargs)
-        except (WorkflowError, SeriesError) as error:
+        except (WorkflowError, SeriesError, NovelError, VideoAssemblyError) as error:
             raise HTTPException(status_code=error.status_code, detail=str(error)) from error
 
     @application.get("/", include_in_schema=False)
@@ -281,7 +304,13 @@ def create_app(
 
     @application.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "app_version": application.version, "api_contract_version": API_CONTRACT_VERSION}
+        return {
+            "status": "ok",
+            "app_version": application.version,
+            "api_contract_version": API_CONTRACT_VERSION,
+            "server_started_at": server_started_at,
+            "server_instance_id": server_instance_id,
+        }
 
     @application.get("/api/system/status")
     def system_status() -> dict[str, Any]:
@@ -289,7 +318,10 @@ def create_app(
             "status": "ok",
             "app_version": application.version,
             "api_contract_version": API_CONTRACT_VERSION,
-            "features": ["series", "series_transfer", "story_continuity_ledger", "quality_checks", "video_jobs", "content_revisions", "production_delivery"],
+            "server_started_at": server_started_at,
+            "server_instance_id": server_instance_id,
+            "python_version": sys.version.split()[0],
+            "features": ["series", "series_transfer", "story_continuity_ledger", "episode_outlines", "longform_novels", "shot_asset_links", "local_video_assembly", "local_subtitles", "assembly_presets", "local_visual_assets", "quality_checks", "story_quality_review", "scheduled_backups", "video_jobs", "content_revisions", "production_delivery"],
             "video_job_worker_running": video_job_worker.is_running,
         }
 
@@ -528,9 +560,101 @@ def create_app(
             payload.model_dump(exclude_unset=True, exclude_none=True),
         )
 
+    @application.post("/api/series/{series_id}/assets/{asset_id}/media")
+    async def upload_series_asset_media(
+        series_id: str,
+        asset_id: str,
+        request: Request,
+        files: list[UploadFile] = File(...),
+    ) -> dict:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host) or not _is_same_origin_request(request):
+            raise HTTPException(status_code=403, detail="系列资产图片上传仅允许从本机工作台发起。")
+        if len(files) > 8:
+            raise HTTPException(status_code=413, detail="每次最多上传 8 张图片。")
+        asset = store.get_series_asset(series_id, asset_id)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="找不到这个系列资产。")
+        existing_media = asset.get("media") or []
+        if len(existing_media) + len(files) > 8:
+            raise HTTPException(status_code=413, detail="每个系列资产最多关联 8 张本地参考图。")
+        created_urls: list[str] = []
+        records: list[dict[str, Any]] = []
+        try:
+            for upload in files:
+                content = await upload.read(20 * 1024 * 1024 + 1)
+                if not content:
+                    raise HTTPException(status_code=422, detail="不能上传空文件。")
+                if len(content) > 20 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="单张参考图不能超过 20 MiB。")
+                if content.startswith(b"\x89PNG\r\n\x1a\n"):
+                    suffix, mime_type = ".png", "image/png"
+                elif content.startswith(b"\xff\xd8\xff"):
+                    suffix, mime_type = ".jpg", "image/jpeg"
+                elif len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+                    suffix, mime_type = ".webp", "image/webp"
+                else:
+                    raise HTTPException(status_code=415, detail="仅支持有效的 PNG、JPEG 或 WebP 图片。")
+                original_name = (upload.filename or "reference-image").replace("\\", "/").rsplit("/", 1)[-1]
+                original_name = re.sub(r"[\x00-\x1f\x7f]", "", original_name).strip()[:180] or "reference-image"
+                asset_url = assets.save(content, suffix)
+                created_urls.append(asset_url)
+                records.append({
+                    "asset_url": asset_url,
+                    "filename": original_name,
+                    "mime_type": mime_type,
+                    "size": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                })
+            return run(series.add_asset_media, series_id, asset_id, records)
+        except Exception:
+            for asset_url in created_urls:
+                (assets.directory / Path(asset_url).name).unlink(missing_ok=True)
+            raise
+        finally:
+            for upload in files:
+                await upload.close()
+
+    @application.get("/api/novels")
+    def list_novels() -> list[dict[str, Any]]:
+        return novels.list_novels()
+
+    @application.post("/api/novels", status_code=201)
+    def create_novel(payload: NovelCreate) -> dict[str, Any]:
+        return run(novels.create_novel, payload.model_dump())
+
+    @application.get("/api/novels/{novel_id}")
+    def get_novel(novel_id: str) -> dict[str, Any]:
+        return run(novels.get_novel, novel_id)
+
+    @application.put("/api/novels/{novel_id}")
+    def update_novel(novel_id: str, payload: NovelUpdate) -> dict[str, Any]:
+        return run(novels.update_novel, novel_id, payload.model_dump(exclude_unset=True, exclude_none=True))
+
+    @application.post("/api/novels/{novel_id}/chapters", status_code=201)
+    def create_novel_chapter(novel_id: str, payload: NovelChapterCreate) -> dict[str, Any]:
+        return run(novels.create_chapter, novel_id, payload.model_dump())
+
+    @application.put("/api/novels/{novel_id}/chapters/{chapter_id}")
+    def update_novel_chapter(novel_id: str, chapter_id: str, payload: NovelChapterUpdate) -> dict[str, Any]:
+        return run(
+            novels.update_chapter, novel_id, chapter_id,
+            payload.model_dump(exclude_unset=True, exclude_none=True),
+        )
+
+    @application.post("/api/novels/{novel_id}/chapters/{chapter_id}/generate")
+    def generate_novel_chapter(
+        novel_id: str, chapter_id: str, payload: NovelChapterGenerateRequest
+    ) -> dict[str, Any]:
+        return run(novels.generate_chapter, novel_id, chapter_id, kind=payload.kind, model=payload.model)
+
+    @application.post("/api/novels/{novel_id}/chapters/{chapter_id}/approve")
+    def approve_novel_chapter(novel_id: str, chapter_id: str) -> dict[str, Any]:
+        return run(novels.approve_chapter, novel_id, chapter_id)
+
     @application.get("/api/projects")
     def list_projects() -> list[dict]:
-        return workflow.list_projects()
+        return [video_assembly.decorate(project) for project in workflow.list_projects()]
 
     @application.post("/api/projects", status_code=201)
     def create_project(payload: ProjectCreate) -> dict:
@@ -542,7 +666,7 @@ def create_app(
 
     @application.get("/api/projects/{project_id}")
     def get_project(project_id: str) -> dict:
-        return run(workflow.get_project, project_id)
+        return video_assembly.decorate(run(workflow.get_project, project_id))
 
     @application.get("/api/projects/{project_id}/export")
     def export_project(project_id: str, request: Request) -> FileResponse:
@@ -613,22 +737,65 @@ def create_app(
 
     @application.post("/api/projects/{project_id}/generate/{stage}")
     def generate(project_id: str, stage: str, payload: GenerateRequest | None = None) -> dict:
-        return run(workflow.generate, project_id, stage, payload.model if payload else None)
+        return video_assembly.decorate(run(workflow.generate, project_id, stage, payload.model if payload else None))
+
+    @application.put("/api/projects/{project_id}/episode-outline")
+    def update_episode_outline(project_id: str, payload: EpisodeOutlineUpdate) -> dict:
+        return video_assembly.decorate(run(workflow.update_episode_outline, project_id, payload.content, payload.status))
+
+    @application.post("/api/projects/{project_id}/episode-outline/generate")
+    def generate_episode_outline(project_id: str, payload: GenerateRequest | None = None) -> dict:
+        return video_assembly.decorate(run(workflow.generate_episode_outline, project_id, payload.model if payload else None))
+
+    @application.put("/api/projects/{project_id}/shots/{shot_id}/assets")
+    def update_shot_assets(project_id: str, shot_id: str, payload: ShotAssetsUpdate) -> dict:
+        return video_assembly.decorate(run(workflow.set_shot_assets, project_id, shot_id, payload.asset_ids))
+
+    @application.put("/api/projects/{project_id}/render-order")
+    def update_render_order(project_id: str, payload: RenderOrderUpdate) -> dict:
+        return run(video_assembly.set_order, project_id, payload.shot_ids)
+
+    @application.put("/api/projects/{project_id}/assembly-settings")
+    def update_assembly_settings(project_id: str, payload: AssemblySettingsUpdate, request: Request) -> dict:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host) or not _is_same_origin_request(request):
+            raise HTTPException(status_code=403, detail="本地合成设置仅允许从本机工作台修改。")
+        return run(video_assembly.update_settings, project_id, **payload.model_dump())
+
+    @application.get("/api/projects/{project_id}/subtitles.{subtitle_format}")
+    def download_project_subtitles(project_id: str, subtitle_format: str, request: Request) -> Response:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host):
+            raise HTTPException(status_code=403, detail="字幕文件仅允许从本机工作台下载。")
+        content = run(video_assembly.generate_subtitles, project_id, subtitle_format)
+        media_type = "application/x-subrip" if subtitle_format == "srt" else "text/plain"
+        return Response(
+            content=content,
+            media_type=f"{media_type}; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="project-subtitles.{subtitle_format}"'},
+        )
+
+    @application.post("/api/projects/{project_id}/assemble")
+    def assemble_project_video(project_id: str, request: Request) -> dict:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host) or not _is_same_origin_request(request):
+            raise HTTPException(status_code=403, detail="本地视频合成仅允许从本机工作台发起。")
+        return run(video_assembly.assemble, project_id)
 
     @application.post("/api/projects/{project_id}/shots/{shot_id}/image")
     def generate_shot_image(project_id: str, shot_id: str) -> dict:
-        return run(workflow.generate_shot_image, project_id, shot_id)
+        return video_assembly.decorate(run(workflow.generate_shot_image, project_id, shot_id))
 
     @application.post("/api/projects/{project_id}/shots/{shot_id}/video", response_model=None)
     def generate_shot_video(
         project_id: str, shot_id: str, confirm_uncertain: bool = False
     ) -> dict | JSONResponse:
-        result = run(
+        result = video_assembly.decorate(run(
             workflow.generate_shot_video,
             project_id,
             shot_id,
             confirm_uncertain=confirm_uncertain,
-        )
+        ))
         shot = next(
             item for item in result["workflow"]["video"]["shots"]
             if item.get("shot_id") == shot_id
@@ -639,11 +806,11 @@ def create_app(
 
     @application.post("/api/projects/{project_id}/shots/{shot_id}/video/cancel")
     def cancel_shot_video(project_id: str, shot_id: str) -> dict:
-        return run(workflow.cancel_queued_shot_video, project_id, shot_id)
+        return video_assembly.decorate(run(workflow.cancel_queued_shot_video, project_id, shot_id))
 
     @application.post("/api/projects/{project_id}/shots/{shot_id}/video/resume")
     def resume_shot_video_polling(project_id: str, shot_id: str) -> dict:
-        return run(workflow.resume_shot_video_polling, project_id, shot_id)
+        return video_assembly.decorate(run(workflow.resume_shot_video_polling, project_id, shot_id))
 
     @application.get("/api/projects/{project_id}/content/{stage}/revisions")
     def list_content_revisions(project_id: str, stage: str) -> dict[str, Any]:
@@ -655,7 +822,7 @@ def create_app(
 
     @application.post("/api/projects/{project_id}/content/{stage}/revisions/{revision_id}/restore")
     def restore_content_revision(project_id: str, stage: str, revision_id: str) -> dict:
-        return run(workflow.restore_revision, project_id, stage, revision_id)
+        return video_assembly.decorate(run(workflow.restore_revision, project_id, stage, revision_id))
 
     @application.post("/api/projects/{project_id}/quality/{stage}")
     def check_content_quality(project_id: str, stage: str) -> dict[str, Any]:
@@ -668,15 +835,15 @@ def create_app(
 
     @application.put("/api/projects/{project_id}/content/{stage}")
     def update_content(project_id: str, stage: str, payload: ContentUpdate) -> dict:
-        return run(workflow.update_content, project_id, stage, payload.content)
+        return video_assembly.decorate(run(workflow.update_content, project_id, stage, payload.content))
 
     @application.post("/api/projects/{project_id}/rollback/{stage}")
     def rollback_stage(project_id: str, stage: str) -> dict:
-        return run(workflow.rollback_to_stage, project_id, stage)
+        return video_assembly.decorate(run(workflow.rollback_to_stage, project_id, stage))
 
     @application.post("/api/projects/{project_id}/approve/{stage}")
     def approve(project_id: str, stage: str) -> dict:
-        return run(workflow.approve, project_id, stage)
+        return video_assembly.decorate(run(workflow.approve, project_id, stage))
 
     @application.get("/api/projects/{project_id}/chat")
     def chat_history(project_id: str) -> list[dict]:

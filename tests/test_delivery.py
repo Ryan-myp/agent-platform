@@ -15,6 +15,7 @@ from app.main import create_app
 from app.providers.catalog import ModelCatalog
 from app.providers.media import AssetStore
 from app.services.delivery import DeliveryPackageError, DeliveryService
+from app.services.video_assembly import VideoAssemblyService
 from app.store import ProjectStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,7 +92,7 @@ def test_delivery_package_contains_human_readable_artifacts_media_and_verified_m
         assert "project.json" not in names
         assert archive.read("01-script.md").decode("utf-8").find("林澄找到姐姐") >= 0
         assert archive.read(f"media/{media_key}") == b"local image bytes"
-        assert "本工具不会自动合并逐镜视频" in archive.read("README.md").decode("utf-8")
+        assert "本地合成 MP4 也需人工审核" in archive.read("README.md").decode("utf-8")
         report = json.loads(archive.read("production-report.json"))
         assert report["final_video_assembled"] is False
         assert report["shots"][0]["image_included"] is True

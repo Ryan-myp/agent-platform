@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import zipfile
@@ -10,6 +11,7 @@ from urllib.parse import unquote, urlsplit
 
 from app.providers.media import AssetStore
 from app.services.project_transfer import MAX_BUNDLE_BYTES, MAX_BUNDLE_MEMBERS, MAX_JSON_BYTES
+from app.services.video_assembly import VideoAssemblyError, VideoAssemblyService
 from app.stages import STAGES
 from app.store import ProjectStore
 
@@ -72,9 +74,51 @@ class DeliveryService:
         else:
             files["04-shot-plan.md"] = "# 镜头任务\n\n当前步骤尚无内容。\n".encode("utf-8")
 
-        media_paths, media_report = self._collect_media(project)
         video = workflow.get("video") if isinstance(workflow.get("video"), dict) else {}
         video_shots = video.get("shots") if isinstance(video.get("shots"), list) else []
+        final_video = video.get("final_video") if isinstance(video.get("final_video"), dict) else {}
+        try:
+            final_is_current = (
+                final_video.get("status") == "ready"
+                and final_video.get("source_signature") == VideoAssemblyService._signature(project)
+            )
+        except VideoAssemblyError:
+            final_is_current = False
+        final_integrity_failed = False
+        if final_is_current:
+            final_key = self._local_media_key(final_video.get("asset_url", ""))
+            root = self.assets.directory.resolve()
+            final_path = (root / final_key) if final_key else None
+            try:
+                final_is_current = bool(
+                    final_path
+                    and not final_path.is_symlink()
+                    and final_path.parent.resolve() == root
+                    and final_path.is_file()
+                    and isinstance(final_video.get("size_bytes"), int)
+                    and not isinstance(final_video.get("size_bytes"), bool)
+                    and final_path.stat().st_size == final_video["size_bytes"]
+                    and isinstance(final_video.get("sha256"), str)
+                    and self._sha256_file(final_path) == final_video["sha256"]
+                )
+            except OSError:
+                final_is_current = False
+            final_integrity_failed = not final_is_current
+        delivery_project = copy.deepcopy(project)
+        delivery_video = ((delivery_project.get("workflow") or {}).get("video") or {})
+        delivery_video.pop("final_video_versions", None)
+        if not final_is_current and isinstance(delivery_video.get("final_video"), dict):
+            delivery_video["final_video"].pop("asset_url", None)
+        media_paths, media_report = self._collect_media(delivery_project)
+        final_video_status = str(final_video.get("status") or "not_assembled")
+        if final_video_status == "ready" and not final_is_current:
+            final_video_status = "stale"
+        final_video_stale_reason = None
+        if final_video_status == "stale":
+            final_video_stale_reason = (
+                "合成 MP4 文件校验失败，请重新合成。"
+                if final_integrity_failed else "镜头片段或剪辑顺序已更改，请重新合成。"
+            )
         production_report = {
             "format": DELIVERY_FORMAT,
             "version": DELIVERY_VERSION,
@@ -89,10 +133,18 @@ class DeliveryService:
             "stages": stage_report,
             "shots": [self._shot_report(shot, media_paths) for shot in video_shots if isinstance(shot, dict)],
             "media": media_report,
-            "final_video_assembled": False,
+            "final_video_assembled": final_is_current,
+            "final_video": {
+                "status": final_video_status,
+                "stale_reason": final_video_stale_reason,
+                "included": self._is_packaged(final_video.get("asset_url"), media_paths) if final_is_current else False,
+                "size_bytes": final_video.get("size_bytes") if final_is_current else None,
+                "duration_seconds": final_video.get("duration_seconds") if final_is_current else None,
+                "sha256": final_video.get("sha256") if final_is_current else None,
+            },
             "notes": [
                 "此交付包包含创作材料和可找到的本地媒体，不代表内容已通过人工验收。",
-                "AI 剪辑方案只是剪辑指导；本工具不会自动把逐镜片段合成为最终成片。",
+                "如果本地合成视频仍匹配当前镜头与顺序，将以 MP4 一并交付；合成成片仍需人工审核。",
                 "非本地供应商媒体链接不会被下载或写入包内，请在原工作台核对可用性。",
             ],
         }
@@ -177,7 +229,9 @@ class DeliveryService:
 
     def _local_media_key(self, value: str) -> str | None:
         parsed = urlsplit(value)
-        path = unquote(parsed.path if parsed.scheme or parsed.netloc else value.split("?", 1)[0].split("#", 1)[0])
+        if parsed.scheme or parsed.netloc:
+            return None
+        path = unquote(value.split("?", 1)[0].split("#", 1)[0])
         prefix = self.assets.public_prefix.rstrip("/") + "/"
         if not path.startswith(prefix):
             return None
@@ -263,13 +317,13 @@ class DeliveryService:
             "- `03-storyboard.md`：分镜\n"
             "- `04-shot-plan.json` 或 `04-shot-plan.md`：逐镜任务与剪辑方案\n"
             "- `production-report.json`：机器可读的制作状态摘要\n"
-            "- `media/`：工作台本地保存且被项目引用的图片 / 视频\n\n"
+            "- `media/`：工作台本地保存且被项目引用的图片 / 视频；如有当前有效的本地合成视频，也会包含最终 MP4\n\n"
             "## 步骤状态\n\n"
             "| 步骤 | 状态 | 内容 |\n|---|---|---|\n"
             f"{stage_rows}\n\n"
             f"已记录视频片段：{videos} 个；打包的本地媒体文件：{local_media} 个；未下载的远程媒体引用：{external_media} 个。\n\n"
             "## 验收提示\n\n"
-            "本包是创作交接材料，不等同于已验收成片。请人工确认所有脚本与镜头；剪辑方案仅是指导，本工具不会自动合并逐镜视频。"
+            "本包是创作交接材料，不等同于已验收成片。请人工确认所有脚本与镜头；本地合成 MP4 也需人工审核。"
             "远程供应商媒体不会被下载，且原链接可能过期；请在工作台核对。项目副本导入 / 备份请使用“导出项目副本”，不要把本交付包当作可恢复备份。\n"
         )
 
