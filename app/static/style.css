@@ -1,5 +1,3 @@
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap');
-
 :root {
   color-scheme: light;
   --ink: #19332e;
@@ -376,6 +374,7 @@ h1, h2, p { margin-top: 0; }
 .chat-form textarea:focus-visible { outline: none; }
 .chat-form textarea::placeholder { color: #929e94; }
 .chat-form-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 5px; }
+#send-chat { flex: 0 0 auto; white-space: nowrap; }
 .chat-composer-tools { min-width: 0; display: flex; align-items: center; gap: 10px; }
 .chat-composer-tools > span { color: var(--muted); font-size: 10px; line-height: 1.5; }
 .chat-attach-button { min-height: 31px; flex: 0 0 auto; display: inline-flex; align-items: center; border: 1px solid #dce6e1; border-radius: 6px; padding: 0 9px; color: #40584f; cursor: pointer; font-size: 11px; font-weight: 600; }

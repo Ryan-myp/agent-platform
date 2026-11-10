@@ -107,14 +107,19 @@ def new_project(client, model=None):
 
 
 def test_home_page_avoids_stale_markup_and_loads_versioned_assets(tmp_path):
-    response = make_client(tmp_path).get("/")
+    client = make_client(tmp_path)
+    response = client.get("/")
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate"
     assert 'id="open-records"' in response.text
     assert 'id="confirm-dialog"' in response.text
     assert "/static/app.js?v=14" in response.text
-    assert "/static/style.css?v=13" in response.text
+    assert "/static/style.css?v=15" in response.text
+
+    stylesheet = client.get("/static/style.css?v=15")
+    assert stylesheet.status_code == 200
+    assert "fonts.googleapis.com" not in stylesheet.text
 
 
 def test_create_generate_edit_and_approve_advances_one_stage(tmp_path):
