@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -180,6 +181,7 @@ class WorkflowService:
         item["content"] = content
         item["status"] = "ready"
         item["updated_at"] = now_iso()
+        item.pop("validation_error", None)
         item.pop("stale_reason", None)
         item.pop("stale_since", None)
         if scene_plan is not None:
@@ -606,6 +608,15 @@ class WorkflowService:
 
         selected_model = model or project["model"]
         profile = self._validate_model(selected_model)
+        if stage == "scenes" and profile.adapter == "openai_compatible":
+            try:
+                configured_output_limit = int(profile.params.get("max_tokens", 0) or 0)
+            except (TypeError, ValueError):
+                configured_output_limit = 0
+            profile = replace(
+                profile,
+                params={**profile.params, "max_tokens": max(configured_output_limit, 8000)},
+            )
         api_key = self.settings.api_key_for(profile)
         if not self.settings.profile_is_configured(profile):
             raise WorkflowError(
@@ -633,6 +644,14 @@ class WorkflowService:
             f"类型要求：{track_instruction}\n当前步骤：{stage}\n要求：{stage_instruction}\n\n"
             f"适用的本地创作技能：\n{skill_context or '无'}"
         )
+        if stage == "scenes":
+            system += (
+                "\n\n结构化输出约束：只输出一个完整 JSON 对象，不要代码围栏、前言或结尾说明。"
+                "每个已确认分镜恰好对应一个镜头任务，不得遗漏、重复或新增；所有字段严格按技能模板。"
+                "中文字段写短句；image_prompt 和 video_prompt 用英文，各不超过 80 个词，只写主体、动作、构图和连续性。"
+                "purpose、visual_description、continuity 各不超过 120 个汉字；edit_plan 各文本字段不超过 80 个汉字，禁止复述整段设定。"
+                "输出前检查双引号、逗号、数组与对象括号全部闭合。"
+            )
         brief = project["brief"]
         if track == "drama":
             brief_context = {
@@ -715,7 +734,18 @@ class WorkflowService:
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 error_category="invalid_model_output",
             )
-            raise WorkflowError(str(exc), 422) from exc
+            previous_item = project["workflow"][stage]
+            self._archive_stage_content(previous_item, "重新生成前的草稿")
+            project["model"] = selected_model
+            project["workflow"][stage] = {
+                "status": "ready",
+                "content": content,
+                "updated_at": now_iso(),
+                "validation_error": str(exc),
+                **({"revisions": previous_item["revisions"]} if previous_item.get("revisions") else {}),
+            }
+            project["updated_at"] = now_iso()
+            return self.store.save(project)
         except Exception as exc:
             self.usage.record(
                 project_id=project_id, modality="text", model_id=selected_model,
@@ -1498,6 +1528,7 @@ class WorkflowService:
             item["edit_plan"] = scene_plan["edit_plan"]
         item["content"] = content
         item["status"] = "ready"
+        item.pop("validation_error", None)
         item.pop("stale_reason", None)
         item.pop("stale_since", None)
         item["updated_at"] = now_iso()
@@ -1527,6 +1558,7 @@ class WorkflowService:
                 raise WorkflowError(str(exc), 422) from exc
             item["shots"] = scene_plan["shots"]
             item["edit_plan"] = scene_plan["edit_plan"]
+            item.pop("validation_error", None)
             video = project["workflow"].setdefault("video", {})
             self._reconcile_video_shots(video, scene_plan["shots"], scene_plan["edit_plan"])
         item["status"] = "approved"

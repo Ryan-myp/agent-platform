@@ -476,6 +476,10 @@ def test_browser_local_video_render_order_saved_before_assembly(tmp_path, monkey
             assert created.status == 201, created.text()
             project = created.json()
             clip_url = application.state.assets.save(b"test local MP4 bytes", ".mp4")
+            keyframe_url = application.state.assets.save(
+                b'<svg xmlns="http://www.w3.org/2000/svg" width="90" height="160"><rect width="90" height="160" fill="#315b50"/></svg>',
+                ".svg",
+            )
             project["active_stage"] = "video"
             project["updated_at"] = datetime.now(timezone.utc).isoformat()
             project["workflow"]["scenes"].update({
@@ -487,7 +491,7 @@ def test_browser_local_video_render_order_saved_before_assembly(tmp_path, monkey
                 "render_order": ["S02", "S01"],
                 "edit_plan": {"sequence": ["S02", "S01"], "pacing": "测试"},
                 "shots": [
-                    {"shot_id": shot_id, "purpose": f"{shot_id} 测试镜头", "visual_description": "港口雨夜", "duration_seconds": 5, "aspect_ratio": "9:16", "image_prompt": "港口", "video_prompt": "缓慢推进", "asset_ids": [], "image": {"status": "ready"}, "video": {"status": "ready", "asset_url": clip_url}}
+                    {"shot_id": shot_id, "purpose": f"{shot_id} 测试镜头", "visual_description": "港口雨夜", "duration_seconds": 5, "aspect_ratio": "9:16", "image_prompt": "港口", "video_prompt": "缓慢推进", "asset_ids": [], "image": {"status": "ready", "asset_url": keyframe_url}, "video": {"status": "ready", "asset_url": clip_url}}
                     for shot_id in ("S01", "S02")
                 ],
             }
@@ -496,6 +500,17 @@ def test_browser_local_video_render_order_saved_before_assembly(tmp_path, monkey
             page.locator(f'.project-link[data-project-id="{project["id"]}"]').click()
             page.locator("#view-toggle").click()
             expect(page.locator(".local-assembly-card")).to_be_visible()
+            contact_sheet = page.locator(".keyframe-contact-sheet")
+            expect(contact_sheet.locator("summary")).to_contain_text("2 / 2 张当前可用")
+            expect(contact_sheet.locator(".keyframe-contact-grid")).to_be_hidden()
+            summary = contact_sheet.locator("summary")
+            summary.focus()
+            summary.press("Enter")
+            expect(contact_sheet.locator(".keyframe-contact-grid")).to_be_visible()
+            expect(contact_sheet.locator(".keyframe-contact-grid img")).to_have_count(2)
+            expect(contact_sheet.locator(".keyframe-contact-grid img").first).to_have_attribute("alt", "S01 · S01 测试镜头")
+            summary.press("Enter")
+            expect(contact_sheet.locator(".keyframe-contact-grid")).to_be_hidden()
             order = page.locator(".render-order-list li")
             expect(order.nth(0)).to_contain_text("S02")
             expect(order.nth(1)).to_contain_text("S01")
@@ -672,7 +687,7 @@ def test_browser_series_copy_quality_revisions_and_compatibility_diagnostics(tmp
             page.evaluate("showCompatibilityStatus({api_contract_version: 1, features: [], video_job_worker_running: false})")
             expect(page.locator("#compatibility-status")).to_contain_text("接口版本不兼容")
             expect(page.locator("#compatibility-status")).to_contain_text("后台工作线程未运行")
-            page.evaluate("showCompatibilityStatus({api_contract_version: 5, features: ['series', 'series_transfer', 'story_continuity_ledger', 'quality_checks', 'video_jobs', 'content_revisions', 'production_delivery', 'episode_outlines', 'longform_novels', 'shot_asset_links', 'local_video_assembly', 'local_subtitles', 'assembly_presets', 'local_visual_assets', 'story_quality_review', 'scheduled_backups'], video_job_worker_running: true, app_version: '0.2.0', server_started_at: '2025-01-01T00:00:00Z', server_instance_id: 'test-instance', python_version: '3.12.0'})")
+            page.evaluate("showCompatibilityStatus({api_contract_version: 7, features: ['manual_storyboard_canvas', 'series', 'series_transfer', 'story_continuity_ledger', 'quality_checks', 'video_jobs', 'content_revisions', 'production_delivery', 'production_reviews', 'episode_outlines', 'longform_novels', 'shot_asset_links', 'local_video_assembly', 'local_subtitles', 'assembly_presets', 'local_visual_assets', 'story_quality_review', 'scheduled_backups'], video_job_worker_running: true, app_version: '0.2.0', server_started_at: '2025-01-01T00:00:00Z', server_instance_id: 'test-instance', python_version: '3.12.0'})")
             expect(page.locator("#compatibility-status")).to_be_hidden()
 
             created_series = page.request.post(
@@ -849,6 +864,99 @@ def test_browser_project_copy_export_import(tmp_path, monkeypatch):
             imported = application.state.workflow.get_project(imported_projects[0]["id"])
             assert imported["id"] != project["id"]
             assert imported["title"].endswith("（导入副本）")
+            assert not external_requests, external_requests
+            assert not page_errors, page_errors
+            assert not http_errors, http_errors
+            browser.close()
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=5)
+
+    assert not server_thread.is_alive(), "Isolated E2E server did not stop cleanly"
+
+
+def test_browser_review_submission_history_and_version_navigation(tmp_path, monkeypatch):
+    base, server, server_thread, application = start_isolated_app(tmp_path, monkeypatch)
+    project_title = "E2E 审阅版本闭环"
+    project = application.state.workflow.create_project({
+        "mode": "workflow",
+        "track": "marketing",
+        "business": "让本地咖啡馆提升复购",
+        "product": project_title,
+        "audience": "附近上班族",
+        "platform": "短视频平台",
+        "duration_seconds": 30,
+        "style": "明亮、真实",
+    })
+    project["workflow"]["script"].update({
+        "status": "ready",
+        "content": "# 第一版脚本\n\n开场：今天就来试试。",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    project["active_stage"] = "script"
+    application.state.workflow.store.save(project)
+    page_errors: list[str] = []
+    http_errors: list[tuple[int, str]] = []
+    external_requests: list[str] = []
+
+    def guard_route(route):
+        if route.request.url.startswith(base):
+            route.continue_()
+        else:
+            external_requests.append(route.request.url)
+            route.abort()
+
+    try:
+        with sync_playwright() as playwright_api:
+            browser = playwright_api.chromium.launch(headless=True)
+            context = browser.new_context(viewport={"width": 1440, "height": 1000})
+            context.route("**/*", guard_route)
+            page = context.new_page()
+            page.set_default_timeout(10_000)
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+            page.on(
+                "response",
+                lambda response: http_errors.append((response.status, response.url))
+                if response.status >= 400 else None,
+            )
+            page.goto(base, wait_until="networkidle")
+            page.locator(f'.project-link[data-project-id="{project["id"]}"]').click()
+            page.locator("#view-toggle").click()
+
+            review_form = page.locator('[data-review-form][data-review-target-type="script"]')
+            expect(review_form).to_be_visible()
+            expect(review_form.get_by_role("combobox", name="审阅结论")).to_be_enabled()
+            review_form.locator('[name="note"]').fill("开场利益点不够明确，请突出复购理由。")
+            with page.expect_response(
+                lambda response: response.request.method == "POST" and response.url.endswith("/reviews")
+            ) as review_response:
+                review_form.get_by_role("button", name="保存审阅记录").click()
+            assert review_response.value.status == 201, review_response.value.text()
+            expect(page.locator(".review-history-item")).to_contain_text("开场利益点不够明确")
+            expect(page.locator("#notice")).to_contain_text("审阅记录已保存")
+
+            updated = application.state.workflow.store.get(project["id"])
+            updated["workflow"]["script"]["content"] = "# 第二版脚本\n\n开场：加入明确的会员复购权益。"
+            updated["workflow"]["script"]["updated_at"] = datetime.now(timezone.utc).isoformat()
+            application.state.workflow.store.save(updated)
+            page.reload(wait_until="networkidle")
+            page.locator(f'.project-link[data-project-id="{project["id"]}"]').click()
+            page.locator("#view-toggle").click()
+            expect(page.locator(".review-history-item .review-version-badge")).to_have_text("旧版本")
+
+            page.locator("#open-records").click()
+            card = page.locator("[data-record-card]").filter(has_text=project_title)
+            card.locator(".record-open-button").click()
+            timeline = page.locator(".project-review-timeline")
+            expect(timeline).to_contain_text("历史版本")
+            jump_button = timeline.locator('[data-review-open-target="script"]')
+            expect(jump_button).to_be_visible()
+            jump_button.click()
+            expect(page.locator("#stage-title")).to_have_text("脚本")
+
+            page.set_viewport_size({"width": 390, "height": 844})
+            dimensions = page.evaluate("({viewport: innerWidth, document: document.documentElement.scrollWidth})")
+            assert dimensions["document"] <= dimensions["viewport"] + 1, dimensions
             assert not external_requests, external_requests
             assert not page_errors, page_errors
             assert not http_errors, http_errors

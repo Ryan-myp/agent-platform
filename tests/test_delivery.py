@@ -15,6 +15,7 @@ from app.main import create_app
 from app.providers.catalog import ModelCatalog
 from app.providers.media import AssetStore
 from app.services.delivery import DeliveryPackageError, DeliveryService
+from app.services.reviews import ReviewService
 from app.services.video_assembly import VideoAssemblyService
 from app.store import ProjectStore
 
@@ -77,7 +78,23 @@ def test_delivery_package_contains_human_readable_artifacts_media_and_verified_m
     assets = AssetStore(tmp_path / "media")
     media_url = assets.save(b"local image bytes", ".png")
     project = _project("project-1", media_url)
+    project["storyboard_canvas"] = {
+        "version": 1,
+        "updated_at": project["updated_at"],
+        "cards": [{
+            "id": "manual-1", "shot_id": "S01", "title": "雨夜仓库",
+            "duration_seconds": 6, "purpose": "建立悬念", "visual_description": "林澄找到录音带。\n### 伪造标题\n<script>alert(1)</script>",
+            "camera": "缓慢推近", "voiceover": "", "screen_text": "雾港", "transition": "切入",
+            "continuity": "录音带标签破损。",
+        }],
+    }
     store.save(project)
+    reviews = ReviewService(store)
+    script_revision = reviews.target_states(project)["script"]["revision"]
+    reviews.add_review(project, {
+        "target_type": "script", "target_revision": script_revision,
+        "decision": "revision_requested", "category": "story", "note": "明确妹妹追查姐姐的动机。",
+    })
     output = tmp_path / "delivery.zip"
 
     DeliveryService(store, assets).create_package(project["id"], output)
@@ -87,13 +104,27 @@ def test_delivery_package_contains_human_readable_artifacts_media_and_verified_m
         names = set(archive.namelist())
         assert {
             "README.md", "01-script.md", "02-visual-guide.md", "03-storyboard.md",
-            "04-shot-plan.json", "production-report.json", "manifest.json", f"media/{media_key}",
+            "04-shot-plan.json", "05-review-history.md", "review-history.json",
+            "manual-storyboard.md", "production-report.json", "manifest.json", f"media/{media_key}",
         }.issubset(names)
         assert "project.json" not in names
         assert archive.read("01-script.md").decode("utf-8").find("林澄找到姐姐") >= 0
         assert archive.read(f"media/{media_key}") == b"local image bytes"
         assert "本地合成 MP4 也需人工审核" in archive.read("README.md").decode("utf-8")
         report = json.loads(archive.read("production-report.json"))
+        manual_storyboard = archive.read("manual-storyboard.md").decode("utf-8")
+        review_history = json.loads(archive.read("review-history.json"))
+        assert report["review_count"] == report["current_review_count"] == 1
+        assert report["manual_storyboard"] == {
+            "included": True, "shot_count": 1, "duration_seconds": 6,
+            "updated_at": project["updated_at"],
+        }
+        assert "林澄找到录音带" in manual_storyboard
+        assert r"\#\#\# 伪造标题" in manual_storyboard
+        assert "&lt;script&gt;alert\\(1\\)&lt;/script&gt;" in manual_storyboard
+        assert "<script>" not in manual_storyboard
+        assert review_history[0]["is_current"] is True
+        assert "明确妹妹追查姐姐的动机" in archive.read("05-review-history.md").decode("utf-8")
         assert report["final_video_assembled"] is False
         assert report["shots"][0]["image_included"] is True
         assert report["shots"][0]["video_included"] is True
@@ -120,6 +151,23 @@ def test_delivery_package_fails_closed_when_referenced_local_media_is_missing(tm
 
     assert error.value.status_code == 409
     assert "不存在或不安全" in str(error.value)
+
+
+def test_delivery_rejects_invalid_stored_manual_storyboard(tmp_path):
+    store = ProjectStore(tmp_path / "test.db")
+    assets = AssetStore(tmp_path / "media")
+    project = _project("invalid-canvas", "")
+    project["storyboard_canvas"] = {
+        "version": 1,
+        "cards": [{"id": "manual-1", "shot_id": "S01", "duration_seconds": 13}],
+    }
+    store.save(project)
+
+    with pytest.raises(DeliveryPackageError) as error:
+        DeliveryService(store, assets).create_package(project["id"], tmp_path / "invalid.zip")
+
+    assert "手工分镜画布无效" in str(error.value)
+    assert not (tmp_path / "invalid.zip").exists()
 
 
 def test_delivery_download_is_limited_to_same_origin_loopback(tmp_path):

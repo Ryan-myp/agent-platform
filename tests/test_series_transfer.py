@@ -89,6 +89,13 @@ def test_series_bundle_round_trip_copies_assets_episodes_chat_and_media_without_
                 "status": "queued", "job_id": "local-queue-id", "provider_task_id": "remote-task-secret",
             }}]
         store.save(project)
+        if number == 2:
+            store.add_project_review({
+                "id": "episode-review-original", "project_id": project["id"], "target_type": "script",
+                "target_id": "", "target_label": "脚本", "target_revision": "c" * 64,
+                "decision": "revision_requested", "category": "continuity", "note": "确认人物称谓连续。",
+                "timecode": None, "created_at": _now(),
+            })
         attachment_id = str(uuid4())
         attachment = {
             "id": attachment_id, "project_id": project["id"], "created_at": _now(),
@@ -132,6 +139,11 @@ def test_series_bundle_round_trip_copies_assets_episodes_chat_and_media_without_
     copied_url = imported_episode["workflow"]["script"]["reference_image"]
     assert copied_url != media_url
     assert (asset_store.directory / Path(urlsplit(copied_url).path).name).read_bytes() == b"episode reference bytes"
+    imported_reviews = store.list_project_reviews(imported_episode["id"])
+    assert len(imported_reviews) == 1
+    assert imported_reviews[0]["id"] != "episode-review-original"
+    assert imported_reviews[0]["project_id"] == imported_episode["id"]
+    assert imported_reviews[0]["note"] == "确认人物称谓连续。"
     imported_messages = store.list_chat_messages(imported_episode["id"])
     imported_attachments = store.list_chat_attachments(imported_episode["id"])
     assert len(imported_messages) == len(imported_attachments) == 1

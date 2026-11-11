@@ -17,6 +17,10 @@ class SeriesEpisodeConflict(RuntimeError):
     pass
 
 
+class ProjectRevisionConflict(RuntimeError):
+    pass
+
+
 class ProjectStore:
     def __init__(self, database_path: Path):
         self.database_path = database_path
@@ -153,6 +157,18 @@ class ProjectStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_usage_events_project_created ON usage_events(project_id, created_at DESC)"
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS project_reviews (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_project_reviews_project_created "
+                "ON project_reviews(project_id, created_at DESC, id DESC)"
+            )
 
     @staticmethod
     def _save_project_record(connection: sqlite3.Connection, project: dict[str, Any]) -> None:
@@ -196,6 +212,7 @@ class ProjectStore:
         attachments: list[dict[str, Any]],
         series: dict[str, Any] | None = None,
         series_assets: list[dict[str, Any]] | None = None,
+        reviews: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Insert a fully remapped project bundle without overwriting existing records."""
         series_assets = series_assets or []
@@ -239,6 +256,11 @@ class ProjectStore:
                     "INSERT INTO chat_attachments (id, project_id, created_at, payload) VALUES (?, ?, ?, ?)",
                     (attachment["id"], project["id"], attachment["created_at"], json.dumps(attachment, ensure_ascii=False)),
                 )
+            for review in reviews or []:
+                connection.execute(
+                    "INSERT INTO project_reviews (id, project_id, created_at, payload) VALUES (?, ?, ?, ?)",
+                    (review["id"], project["id"], review["created_at"], json.dumps(review, ensure_ascii=False)),
+                )
         return project
 
     def import_series_bundle(
@@ -278,6 +300,11 @@ class ProjectStore:
                     connection.execute(
                         "INSERT INTO chat_attachments (id, project_id, created_at, payload) VALUES (?, ?, ?, ?)",
                         (attachment["id"], project["id"], attachment["created_at"], json.dumps(attachment, ensure_ascii=False)),
+                    )
+                for review in record.get("reviews", []):
+                    connection.execute(
+                        "INSERT INTO project_reviews (id, project_id, created_at, payload) VALUES (?, ?, ?, ?)",
+                        (review["id"], project["id"], review["created_at"], json.dumps(review, ensure_ascii=False)),
                     )
         return {"series": series, "assets": assets, "episodes": episodes}
 
@@ -571,6 +598,40 @@ class ProjectStore:
                 "SELECT payload FROM projects ORDER BY updated_at DESC"
             ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
+
+    def add_project_review(
+        self, review: dict[str, Any], *, expected_updated_at: str | None = None
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT updated_at FROM projects WHERE id = ?", (review["project_id"],)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"找不到项目 {review['project_id']}。")
+            if expected_updated_at is not None and row["updated_at"] != expected_updated_at:
+                raise ProjectRevisionConflict("项目内容已更新，请刷新后再提交审阅。")
+            connection.execute(
+                "INSERT INTO project_reviews (id, project_id, created_at, payload) VALUES (?, ?, ?, ?)",
+                (review["id"], review["project_id"], review["created_at"], json.dumps(review, ensure_ascii=False)),
+            )
+        return review
+
+    def list_project_reviews(self, project_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM project_reviews WHERE project_id = ? ORDER BY created_at DESC, id DESC",
+                (project_id,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def count_project_reviews(self, project_id: str) -> int:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS review_count FROM project_reviews WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        return int(row["review_count"])
 
     def append_chat_message(self, project_id: str, message: dict[str, Any]) -> dict[str, Any]:
         with self._connection() as connection:

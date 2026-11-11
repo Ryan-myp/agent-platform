@@ -49,6 +49,27 @@ class RenderOrderUpdate(BaseModel):
     shot_ids: list[str] = Field(min_length=1, max_length=24)
 
 
+class StoryboardCanvasCard(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    shot_id: str = Field(min_length=1, max_length=40, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$")
+    title: str = Field(default="", max_length=120)
+    duration_seconds: int = Field(default=5, ge=4, le=12)
+    purpose: str = Field(default="", max_length=500)
+    visual_description: str = Field(default="", max_length=2000)
+    camera: str = Field(default="", max_length=500)
+    voiceover: str = Field(default="", max_length=1200)
+    screen_text: str = Field(default="", max_length=500)
+    transition: str = Field(default="", max_length=300)
+    continuity: str = Field(default="", max_length=1200)
+
+
+class StoryboardCanvasUpdate(BaseModel):
+    expected_updated_at: str = Field(min_length=20, max_length=80)
+    cards: list[StoryboardCanvasCard] = Field(max_length=24)
+
+
 class NovelCreate(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     logline: str = Field(default="", max_length=3000)
@@ -123,6 +144,16 @@ class ModelCatalogUpdate(BaseModel):
 
 class ContentUpdate(BaseModel):
     content: str = Field(min_length=1, max_length=50000)
+
+
+class ReviewCreate(BaseModel):
+    target_type: Literal["script", "storyboard", "clip", "final_video"]
+    target_id: str = Field(default="", max_length=80)
+    target_revision: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    decision: Literal["approved", "revision_requested", "comment"]
+    category: Literal["general", "story", "continuity", "visual", "audio", "editing", "subtitle", "technical", "other"] = "general"
+    note: str = Field(default="", max_length=2000)
+    timecode: str | None = Field(default=None, max_length=6)
 
 
 class ChatRequest(BaseModel):

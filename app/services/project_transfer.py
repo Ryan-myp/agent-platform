@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 from app.providers.media import AssetStore
+from app.services.storyboard_canvas import StoryboardCanvasError, StoryboardCanvasService
 from app.store import ProjectStore
 
 BUNDLE_FORMAT = "agent-platform-project"
@@ -45,10 +46,12 @@ class ProjectTransferService:
             raise ProjectTransferError("找不到要导出的项目。", status_code=404)
         messages = self.store.list_chat_messages(project_id)
         attachments = self.store.list_chat_attachments(project_id)
+        reviews = self.store.list_project_reviews(project_id)
         files: dict[str, bytes] = {
             "project.json": self._json_bytes(project),
             "chat-messages.json": self._json_bytes(messages),
             "chat-attachments.json": self._json_bytes(attachments),
+            "project-reviews.json": self._json_bytes(reviews),
         }
         series_snapshot: dict[str, Any] | None = None
         series_id = project.get("series_id")
@@ -146,10 +149,15 @@ class ProjectTransferService:
             attachments = self._read_json(archive, infos["chat-attachments.json"], MAX_JSON_BYTES)
             series_bundle = self._read_json(archive, infos["series.json"], MAX_JSON_BYTES) if "series.json" in infos else None
             self._validate_project_data(project, messages, attachments, series_bundle)
+            reviews = (
+                self._read_json(archive, infos["project-reviews.json"], MAX_JSON_BYTES)
+                if "project-reviews.json" in infos else []
+            )
+            self._validate_review_records(reviews, str(project["id"]))
 
             source_media_keys = self._collect_media_keys([project, messages, attachments, series_bundle])
             archived_media_keys = {name.removeprefix("media/") for name in declared if name.startswith("media/")}
-            supported_names = required | {"series.json"}
+            supported_names = required | {"series.json", "project-reviews.json"}
             if any(not name.startswith("media/") and name not in supported_names for name in declared):
                 raise ProjectTransferError("项目导入包包含不受支持的文件。")
             if source_media_keys != archived_media_keys:
@@ -159,6 +167,7 @@ class ProjectTransferService:
             imported_project = copy.deepcopy(project)
             imported_messages = copy.deepcopy(messages)
             imported_attachments = copy.deepcopy(attachments)
+            imported_reviews = copy.deepcopy(reviews)
             imported_series: dict[str, Any] | None = None
             imported_series_assets: list[dict[str, Any]] = []
             warnings: list[str] = []
@@ -194,6 +203,9 @@ class ProjectTransferService:
                 self._rewrite_local_media(imported_messages, media_url_map)
                 self._rewrite_local_media(imported_attachments, media_url_map)
                 self._remap_chat(imported_messages, imported_attachments, attachment_id_map, new_project_id)
+                for review in imported_reviews:
+                    review["id"] = str(uuid4())
+                    review["project_id"] = new_project_id
                 self._rewrite_local_media(imported_series, media_url_map)
                 self._rewrite_local_media(imported_series_assets, media_url_map)
 
@@ -207,6 +219,7 @@ class ProjectTransferService:
                     attachments=imported_attachments,
                     series=imported_series,
                     series_assets=imported_series_assets,
+                    reviews=imported_reviews,
                 )
             except Exception:
                 for path in installed_paths:
@@ -285,11 +298,66 @@ class ProjectTransferService:
             raise ProjectTransferError("项目导入包文件校验失败。")
 
     @staticmethod
+    def _validate_review_records(records: Any, source_project_id: str) -> None:
+        if not isinstance(records, list) or len(records) > 100_000:
+            raise ProjectTransferError("项目导入包中的审阅记录无效。")
+        seen: set[str] = set()
+        target_types = {"script", "storyboard", "clip", "final_video"}
+        decisions = {"approved", "revision_requested", "comment"}
+        categories = {"general", "story", "continuity", "visual", "audio", "editing", "subtitle", "technical", "other"}
+        for record in records:
+            if not isinstance(record, dict):
+                raise ProjectTransferError("项目导入包包含无效审阅记录。")
+            record_id = record.get("id")
+            revision = record.get("target_revision")
+            target_type = record.get("target_type")
+            target_id = record.get("target_id", "")
+            decision = record.get("decision")
+            note = record.get("note", "")
+            created_at = record.get("created_at")
+            timecode = record.get("timecode")
+            valid_timecode = timecode is None
+            if isinstance(timecode, str) and re.fullmatch(r"(\d{1,3}):([0-5]\d)", timecode):
+                minutes, seconds = (int(part) for part in timecode.split(":"))
+                valid_timecode = minutes * 60 + seconds <= 1800
+            valid_timestamp = False
+            if isinstance(created_at, str) and len(created_at) <= 64:
+                try:
+                    valid_timestamp = datetime.fromisoformat(created_at.replace("Z", "+00:00")).tzinfo is not None
+                except ValueError:
+                    pass
+            if (
+                not isinstance(record_id, str) or not record_id or len(record_id) > 80 or record_id in seen
+                or record.get("project_id") != source_project_id
+                or not isinstance(target_type, str) or target_type not in target_types
+                or not isinstance(decision, str) or decision not in decisions
+                or not isinstance(record.get("category"), str) or record.get("category") not in categories
+                or not valid_timestamp
+                or not isinstance(record.get("target_label"), str) or len(record.get("target_label", "")) > 200
+                or not isinstance(target_id, str) or len(target_id) > 80
+                or (target_type == "clip") != bool(target_id)
+                or not isinstance(note, str) or len(note) > 2000
+                or (decision != "approved" and not note.strip())
+                or not valid_timecode
+                or (timecode is not None and target_type not in {"clip", "final_video"})
+                or not isinstance(revision, str) or not _HASH_PATTERN.fullmatch(revision)
+            ):
+                raise ProjectTransferError("项目导入包包含无效审阅记录。")
+            seen.add(record_id)
+
+    @staticmethod
     def _validate_project_data(project: Any, messages: Any, attachments: Any, series_bundle: Any) -> None:
         if not isinstance(project, dict) or not isinstance(project.get("id"), str) or not project["id"]:
             raise ProjectTransferError("导入包中的项目记录无效。")
         if project.get("mode") not in {"chat", "workflow"}:
             raise ProjectTransferError("导入包中的项目类型不受支持。")
+        if "storyboard_canvas" in project:
+            if project.get("mode") != "workflow":
+                raise ProjectTransferError("手工分镜画布仅适用于创作流程项目。")
+            try:
+                project["storyboard_canvas"] = StoryboardCanvasService.validate_record(project["storyboard_canvas"])
+            except StoryboardCanvasError as error:
+                raise ProjectTransferError("导入包中的手工分镜画布无效。") from error
         if not isinstance(messages, list) or not isinstance(attachments, list):
             raise ProjectTransferError("导入包中的聊天数据无效。")
         if any(not isinstance(item, dict) or not isinstance(item.get("id"), str) or not isinstance(item.get("created_at"), str) for item in messages):

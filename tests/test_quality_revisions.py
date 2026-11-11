@@ -90,7 +90,7 @@ def test_revision_restore_quality_report_and_diagnostics_routes(tmp_path):
     assert status["api_contract_version"] == API_CONTRACT_VERSION
     assert status["server_started_at"]
     assert status["python_version"]
-    assert {"series_transfer", "story_continuity_ledger", "quality_checks", "story_quality_review", "local_subtitles", "assembly_presets", "local_visual_assets", "scheduled_backups", "video_jobs", "content_revisions", "production_delivery"}.issubset(set(status["features"]))
+    assert {"series_transfer", "story_continuity_ledger", "quality_checks", "story_quality_review", "local_subtitles", "assembly_presets", "local_visual_assets", "scheduled_backups", "video_jobs", "content_revisions", "production_delivery", "production_reviews"}.issubset(set(status["features"]))
     assert isinstance(status["video_job_worker_running"], bool)
     jobs = client.get("/api/video-jobs")
     assert jobs.status_code == 200

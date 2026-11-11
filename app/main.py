@@ -43,6 +43,8 @@ from app.models import (
     ModelUpdate,
     ProjectCreate,
     ProjectTitleUpdate,
+    ReviewCreate,
+    StoryboardCanvasUpdate,
     AssemblySettingsUpdate,
     SeriesAssetCreate,
     SeriesAssetUpdate,
@@ -72,11 +74,13 @@ from app.services.delivery import DeliveryPackageError, DeliveryService
 from app.services.series_transfer import SeriesTransferService
 from app.services.novels import NovelError, NovelService
 from app.services.video_assembly import VideoAssemblyError, VideoAssemblyService
+from app.services.reviews import ReviewError, ReviewService
+from app.services.storyboard_canvas import StoryboardCanvasError, StoryboardCanvasService
 from app.skills.loader import SkillLoader
 from app.store import ProjectStore
 
 ROOT = Path(__file__).resolve().parent.parent
-API_CONTRACT_VERSION = 5
+API_CONTRACT_VERSION = 7
 _SECRET_PARAM_NAMES = {"api_key", "apikey", "authorization", "access_token", "refresh_token", "secret"}
 
 
@@ -218,6 +222,8 @@ def create_app(
     series_transfer = SeriesTransferService(store, project_transfer)
     novels = NovelService(store, current_settings, usage)
     video_assembly = VideoAssemblyService(store, assets)
+    reviews = ReviewService(store)
+    storyboard_canvas = StoryboardCanvasService(store)
 
     server_started_at: str | None = datetime.now(timezone.utc).isoformat()
     server_instance_id = uuid4().hex[:12]
@@ -250,6 +256,8 @@ def create_app(
     application.state.series_transfer = series_transfer
     application.state.novels = novels
     application.state.video_assembly = video_assembly
+    application.state.reviews = reviews
+    application.state.storyboard_canvas = storyboard_canvas
     application.state.model_credentials = credential_store
     application.state.video_job_worker = video_job_worker
     catalog_update_lock = threading.Lock()
@@ -321,7 +329,7 @@ def create_app(
             "server_started_at": server_started_at,
             "server_instance_id": server_instance_id,
             "python_version": sys.version.split()[0],
-            "features": ["series", "series_transfer", "story_continuity_ledger", "episode_outlines", "longform_novels", "shot_asset_links", "local_video_assembly", "local_subtitles", "assembly_presets", "local_visual_assets", "quality_checks", "story_quality_review", "scheduled_backups", "video_jobs", "content_revisions", "production_delivery"],
+            "features": ["series", "series_transfer", "story_continuity_ledger", "episode_outlines", "longform_novels", "shot_asset_links", "local_video_assembly", "local_subtitles", "assembly_presets", "local_visual_assets", "quality_checks", "story_quality_review", "scheduled_backups", "video_jobs", "content_revisions", "production_delivery", "production_reviews", "manual_storyboard_canvas"],
             "video_job_worker_running": video_job_worker.is_running,
         }
 
@@ -654,7 +662,7 @@ def create_app(
 
     @application.get("/api/projects")
     def list_projects() -> list[dict]:
-        return [video_assembly.decorate(project) for project in workflow.list_projects()]
+        return [reviews.decorate(video_assembly.decorate(project), include_records=False) for project in workflow.list_projects()]
 
     @application.post("/api/projects", status_code=201)
     def create_project(payload: ProjectCreate) -> dict:
@@ -666,7 +674,31 @@ def create_app(
 
     @application.get("/api/projects/{project_id}")
     def get_project(project_id: str) -> dict:
-        return video_assembly.decorate(run(workflow.get_project, project_id))
+        return reviews.decorate(video_assembly.decorate(run(workflow.get_project, project_id)))
+
+    @application.put("/api/projects/{project_id}/storyboard-canvas")
+    def update_storyboard_canvas(project_id: str, payload: StoryboardCanvasUpdate, request: Request) -> dict:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host) or not _is_same_origin_request(request):
+            raise HTTPException(status_code=403, detail="分镜画布仅允许从本机工作台保存。")
+        try:
+            project = storyboard_canvas.update(project_id, payload.expected_updated_at, payload.cards)
+        except StoryboardCanvasError as error:
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        return reviews.decorate(video_assembly.decorate(project))
+
+    @application.post("/api/projects/{project_id}/reviews", status_code=201)
+    def create_project_review(project_id: str, payload: ReviewCreate, request: Request) -> dict:
+        client_host = request.client.host if request.client else ""
+        if not _is_loopback(client_host) or not _is_same_origin_request(request):
+            raise HTTPException(status_code=403, detail="审阅记录仅允许从本机工作台提交。")
+        project = video_assembly.decorate(run(workflow.get_project, project_id))
+        try:
+            reviews.add_review(project, payload.model_dump())
+        except ReviewError as error:
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        updated = video_assembly.decorate(run(workflow.get_project, project_id))
+        return reviews.decorate(updated)
 
     @application.get("/api/projects/{project_id}/export")
     def export_project(project_id: str, request: Request) -> FileResponse:

@@ -22,11 +22,41 @@ def _decode_json(content: str) -> dict[str, Any]:
     source = content.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", source, flags=re.IGNORECASE | re.DOTALL)
     if fenced:
-        source = fenced.group(1)
+        source = fenced.group(1).strip()
     try:
         value = json.loads(source, parse_constant=_reject_json_constant)
-    except (json.JSONDecodeError, ScenePlanError) as exc:
-        raise ScenePlanError("场景任务必须是有效 JSON。请在预览中检查格式，或重新生成任务。") from exc
+    except (json.JSONDecodeError, ScenePlanError) as original_error:
+        decoder = json.JSONDecoder(parse_constant=_reject_json_constant)
+        value = None
+        for match in re.finditer(r"\{", source):
+            try:
+                candidate, _ = decoder.raw_decode(source, match.start())
+            except (json.JSONDecodeError, ScenePlanError):
+                continue
+            if isinstance(candidate, dict) and "shots" in candidate:
+                value = candidate
+                break
+        if value is None:
+            shots_match = re.search(r'"shots"\s*:\s*', source)
+            if shots_match:
+                array_start = source.find("[", shots_match.end())
+                if array_start >= 0:
+                    try:
+                        shots, _ = decoder.raw_decode(source, array_start)
+                    except (json.JSONDecodeError, ScenePlanError):
+                        shots = None
+                    if isinstance(shots, list):
+                        value = {"shots": shots}
+                        edit_plan_match = re.search(r'"edit_plan"\s*:\s*', source)
+                        if edit_plan_match:
+                            try:
+                                edit_plan, _ = decoder.raw_decode(source, edit_plan_match.end())
+                            except (json.JSONDecodeError, ScenePlanError):
+                                edit_plan = None
+                            if isinstance(edit_plan, dict):
+                                value["edit_plan"] = edit_plan
+        if value is None:
+            raise ScenePlanError("场景任务必须是有效 JSON。请检查完整性和格式；原始输出已保留供编辑。") from original_error
     if not isinstance(value, dict):
         raise ScenePlanError("场景任务 JSON 顶层必须是对象。")
     return value

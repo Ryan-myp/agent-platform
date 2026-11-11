@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import zipfile
@@ -107,8 +108,25 @@ def _store_with_series_and_media(tmp_path: Path):
 
 def test_project_bundle_round_trip_remaps_records_and_media_without_resuming_tasks(tmp_path):
     store, assets, original, media_url = _store_with_series_and_media(tmp_path)
+    original["storyboard_canvas"] = {
+        "version": 1,
+        "updated_at": _now(),
+        "cards": [{
+            "id": "canvas-card-1", "shot_id": "S01", "title": "打开旧仓库",
+            "duration_seconds": 6, "purpose": "建立悬念", "visual_description": "林澄推开仓库门。",
+            "camera": "缓慢推近", "voiceover": "", "screen_text": "雾港", "transition": "切入",
+            "continuity": "雨夜。",
+        }],
+    }
+    store.save(original)
     service = ProjectTransferService(store, assets)
     archive_path = tmp_path / "project.zip"
+    store.add_project_review({
+        "id": "review-original", "project_id": original["id"], "target_type": "script",
+        "target_id": "", "target_label": "脚本", "target_revision": "a" * 64,
+        "decision": "comment", "category": "continuity", "note": "核对人物称谓。",
+        "timecode": None, "created_at": _now(),
+    })
 
     service.create_export(original["id"], archive_path)
     with archive_path.open("rb") as package:
@@ -119,6 +137,8 @@ def test_project_bundle_round_trip_remaps_records_and_media_without_resuming_tas
     assert imported["title"].endswith("（导入副本）")
     assert imported["series_id"] != original["series_id"]
     assert imported["episode_number"] == original["episode_number"]
+    assert imported["storyboard_canvas"]["cards"][0]["visual_description"] == "林澄推开仓库门。"
+    assert imported["storyboard_canvas"]["cards"][0]["id"] == "canvas-card-1"
     assert "其他分集" in result["warnings"][0]
     assert "未恢复供应商任务" in result["warnings"][1]
     video = imported["workflow"]["video"]["shots"][0]["video"]
@@ -141,6 +161,11 @@ def test_project_bundle_round_trip_remaps_records_and_media_without_resuming_tas
     assert attachments[0]["storage_key"] != Path(urlsplit(media_url).path).name
     assert store.get_series(imported["series_id"])["title"].endswith("（导入副本）")
     assert store.list_series_episodes(imported["series_id"])[0]["id"] == imported["id"]
+    imported_reviews = store.list_project_reviews(imported["id"])
+    assert len(imported_reviews) == 1
+    assert imported_reviews[0]["id"] != "review-original"
+    assert imported_reviews[0]["project_id"] == imported["id"]
+    assert imported_reviews[0]["note"] == "核对人物称谓。"
     assert store.list_usage_events(project_id=imported["id"]) == []
 
 
@@ -166,6 +191,63 @@ def test_project_import_rejects_tampered_archive_without_partial_records_or_file
             service.import_bundle(package)
     assert {item["id"] for item in store.list()} == {project["id"]}
     assert {path.name for path in assets.directory.iterdir()} == before
+
+
+def test_project_import_accepts_legacy_bundle_without_review_file(tmp_path):
+    store = ProjectStore(tmp_path / "legacy.db")
+    assets = AssetStore(tmp_path / "legacy-media")
+    project = _project("legacy-project")
+    project["series_id"] = None
+    project["episode_number"] = None
+    store.save(project)
+    service = ProjectTransferService(store, assets)
+    source = tmp_path / "current.zip"
+    service.create_export(project["id"], source)
+    with zipfile.ZipFile(source) as archive:
+        members = {name: archive.read(name) for name in archive.namelist() if name != "project-reviews.json"}
+    manifest = json.loads(members["manifest.json"])
+    manifest["files"] = [item for item in manifest["files"] if item["path"] != "project-reviews.json"]
+    members["manifest.json"] = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+    legacy = io.BytesIO()
+    with zipfile.ZipFile(legacy, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+
+    legacy.seek(0)
+    imported = service.import_bundle(legacy)["project"]
+    assert store.list_project_reviews(imported["id"]) == []
+
+
+def test_project_import_rejects_malformed_review_records_without_partial_import(tmp_path):
+    store, assets, project, _ = _store_with_series_and_media(tmp_path)
+    store.add_project_review({
+        "id": "review-original", "project_id": project["id"], "target_type": "script",
+        "target_id": "", "target_label": "脚本", "target_revision": "a" * 64,
+        "decision": "comment", "category": "general", "note": "请核对。",
+        "timecode": None, "created_at": _now(),
+    })
+    service = ProjectTransferService(store, assets)
+    source = tmp_path / "valid.zip"
+    service.create_export(project["id"], source)
+    with zipfile.ZipFile(source) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    reviews = json.loads(members["project-reviews.json"])
+    reviews[0]["target_type"] = []
+    members["project-reviews.json"] = json.dumps(reviews, ensure_ascii=False).encode("utf-8")
+    manifest = json.loads(members["manifest.json"])
+    record = next(item for item in manifest["files"] if item["path"] == "project-reviews.json")
+    record["size"] = len(members["project-reviews.json"])
+    record["sha256"] = hashlib.sha256(members["project-reviews.json"]).hexdigest()
+    members["manifest.json"] = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+    malformed = io.BytesIO()
+    with zipfile.ZipFile(malformed, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+
+    malformed.seek(0)
+    with pytest.raises(ProjectTransferError, match="无效审阅记录"):
+        service.import_bundle(malformed)
+    assert [item["id"] for item in store.list()] == [project["id"]]
 
 
 def test_project_import_rejects_archive_path_traversal(tmp_path):

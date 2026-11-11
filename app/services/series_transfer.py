@@ -48,6 +48,9 @@ class SeriesTransferService:
             files[f"{prefix}/project.json"] = self.transfer._json_bytes(project)
             files[f"{prefix}/chat-messages.json"] = self.transfer._json_bytes(messages)
             files[f"{prefix}/chat-attachments.json"] = self.transfer._json_bytes(attachments)
+            files[f"{prefix}/project-reviews.json"] = self.transfer._json_bytes(
+                self.store.list_project_reviews(project["id"])
+            )
             values.extend((project, messages, attachments))
         media_keys = self.transfer._collect_media_keys(values)
         media_root = self.transfer.assets.directory.resolve()
@@ -124,13 +127,15 @@ class SeriesTransferService:
                     continue
                 parts = name.split("/")
                 if len(parts) != 3 or parts[0] != "episodes" or not parts[1].isdigit() or parts[2] not in {
-                    "project.json", "chat-messages.json", "chat-attachments.json"
+                    "project.json", "chat-messages.json", "chat-attachments.json", "project-reviews.json"
                 }:
                     raise ProjectTransferError("系列导入包包含不受支持的文件。")
                 episode_groups.setdefault(parts[1], set()).add(parts[2])
             if len(episode_groups) > 250:
                 raise ProjectTransferError("系列导入包最多支持 250 集。", status_code=413)
-            if any(names != {"project.json", "chat-messages.json", "chat-attachments.json"} for names in episode_groups.values()):
+            required_episode_files = {"project.json", "chat-messages.json", "chat-attachments.json"}
+            allowed_episode_files = required_episode_files | {"project-reviews.json"}
+            if any(not required_episode_files.issubset(names) or not names.issubset(allowed_episode_files) for names in episode_groups.values()):
                 raise ProjectTransferError("系列导入包包含不完整的分集数据。")
             if manifest.get("episode_count") != len(episode_groups):
                 raise ProjectTransferError("系列导入包分集数量与清单不一致。")
@@ -143,7 +148,12 @@ class SeriesTransferService:
                 project = self.transfer._read_json(archive, infos[f"{prefix}/project.json"], MAX_JSON_BYTES)
                 messages = self.transfer._read_json(archive, infos[f"{prefix}/chat-messages.json"], MAX_JSON_BYTES)
                 attachments = self.transfer._read_json(archive, infos[f"{prefix}/chat-attachments.json"], MAX_JSON_BYTES)
+                reviews = (
+                    self.transfer._read_json(archive, infos[f"{prefix}/project-reviews.json"], MAX_JSON_BYTES)
+                    if f"{prefix}/project-reviews.json" in infos else []
+                )
                 self.transfer._validate_project_data(project, messages, attachments, bundle)
+                self.transfer._validate_review_records(reviews, str(project.get("id") or ""))
                 if project.get("track") != "drama" or project.get("mode") != "workflow":
                     raise ProjectTransferError("系列导入包仅支持短剧工作流分集。")
                 number = project.get("episode_number")
@@ -152,7 +162,7 @@ class SeriesTransferService:
                 if number in episode_numbers:
                     raise ProjectTransferError("系列导入包包含重复集数。")
                 episode_numbers.add(number)
-                episodes.append({"project": project, "messages": messages, "attachments": attachments})
+                episodes.append({"project": project, "messages": messages, "attachments": attachments, "reviews": reviews})
                 media_values.extend((project, messages, attachments))
 
             source_media_keys = self.transfer._collect_media_keys(media_values)
@@ -186,6 +196,7 @@ class SeriesTransferService:
                 project = copy.deepcopy(record["project"])
                 messages = copy.deepcopy(record["messages"])
                 attachments = copy.deepcopy(record["attachments"])
+                reviews = copy.deepcopy(record["reviews"])
                 source_project_id = str(project["id"])
                 project_id = str(uuid4())
                 project.update({
@@ -205,7 +216,10 @@ class SeriesTransferService:
                         warnings.append("未恢复供应商任务；在途任务标记为中断，需核对结果后再手动重试。")
                 attachment_ids = {str(item["id"]): str(uuid4()) for item in attachments}
                 self.transfer._remap_chat(messages, attachments, attachment_ids, project_id)
-                imported_episodes.append({"project": project, "messages": messages, "attachments": attachments})
+                for review in reviews:
+                    review["id"] = str(uuid4())
+                    review["project_id"] = project_id
+                imported_episodes.append({"project": project, "messages": messages, "attachments": attachments, "reviews": reviews})
 
             media_stage, media_url_map, installed_paths = self.transfer._stage_media(archive, infos, archived_media_keys)
             try:

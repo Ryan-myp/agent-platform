@@ -1,7 +1,7 @@
 let videoJobPollTimer = null;
 let videoJobPollInFlight = false;
 let storageCleanupPreview = null;
-const EXPECTED_API_CONTRACT_VERSION = 5;
+const EXPECTED_API_CONTRACT_VERSION = 7;
 
 const state = {
   config: null,
@@ -27,6 +27,18 @@ const state = {
   renameProjectId: null,
   recordFilter: "all",
   viewMode: "new",
+  reviewHydrating: false,
+  canvasProjectId: null,
+  canvasDraft: [],
+  canvasUpdatedAt: null,
+  canvasSavedSnapshot: "[]",
+  canvasRevision: 0,
+  canvasSavedRevision: 0,
+  canvasSaveTimer: null,
+  canvasSaveInFlight: false,
+  canvasSaveQueued: false,
+  canvasSaveError: "",
+  canvasConflictProject: null,
 };
 
 const workspace = document.querySelector("#workspace");
@@ -226,14 +238,19 @@ async function api(path, options = {}) {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.detail || `请求失败（${response.status}）`);
+  if (!response.ok) {
+    const detail = typeof payload.detail === "string" ? payload.detail : `请求失败（${response.status}）`;
+    const error = new Error(detail);
+    error.status = response.status;
+    throw error;
+  }
   return payload;
 }
 
 function showCompatibilityStatus(status) {
   const banner = document.querySelector("#compatibility-status");
   if (!banner) return;
-  const required = ["series", "series_transfer", "story_continuity_ledger", "episode_outlines", "longform_novels", "shot_asset_links", "local_video_assembly", "local_subtitles", "assembly_presets", "local_visual_assets", "quality_checks", "story_quality_review", "scheduled_backups", "video_jobs", "content_revisions", "production_delivery"];
+  const required = ["series", "series_transfer", "story_continuity_ledger", "episode_outlines", "longform_novels", "shot_asset_links", "local_video_assembly", "local_subtitles", "assembly_presets", "local_visual_assets", "quality_checks", "story_quality_review", "scheduled_backups", "video_jobs", "content_revisions", "production_delivery", "production_reviews", "manual_storyboard_canvas"];
   const missing = required.filter((feature) => !status?.features?.includes(feature));
   const messages = [];
   const clientVersion = document.querySelector('meta[name="client-bundle-version"]')?.content || "未知";
@@ -650,6 +667,36 @@ function renderShotAssetAssignment(shot) {
   </section>`;
 }
 
+const reviewDecisionLabels = { approved: "通过", revision_requested: "需修改", comment: "意见" };
+const reviewCategoryLabels = { general: "综合", story: "故事", continuity: "连续性", visual: "画面", audio: "声音", editing: "剪辑", subtitle: "字幕", technical: "技术", other: "其他" };
+
+function renderReviewPanel(project, targetType, targetId = "") {
+  const key = targetType === "clip" ? `clip:${targetId}` : targetType;
+  const target = project.review_targets?.[key];
+  const records = (project.review_records || []).filter((item) => item.target_type === targetType && (item.target_id || "") === targetId);
+  const titleId = `review-title-${targetType}-${targetId || "main"}`;
+  const history = records.slice(0, 3).map((record) => `<li class="review-history-item ${record.is_current ? "is-current" : "is-historical"}">
+    <div class="review-history-meta"><strong>${escapeHTML(reviewDecisionLabels[record.decision] || "意见")}</strong><span>${escapeHTML(reviewCategoryLabels[record.category] || record.category || "综合")}</span>${record.timecode ? `<span>时间码 ${escapeHTML(record.timecode)}</span>` : ""}<time>${escapeHTML(recordDate(record.created_at))}</time><span class="review-version-badge">${record.is_current ? "当前版本" : "旧版本"}</span></div>
+    ${record.note ? `<p>${escapeHTML(record.note)}</p>` : ""}</li>`).join("");
+  const disabled = !target?.available;
+  return `<section class="review-panel" aria-labelledby="${escapeHTML(titleId)}">
+    <div class="review-panel-heading"><div><p class="section-kicker">人工审阅 · 绑定内容版本</p><h3 id="${escapeHTML(titleId)}">审阅与修改意见</h3></div><span>${records.length ? `${records.length} 条记录` : "尚无审阅记录"}</span></div>
+    ${disabled ? `<p class="review-unavailable" role="status">${escapeHTML(target?.reason || "当前版本尚不可审阅。")}</p>` : `<p class="review-version-note">提交后会绑定当前版本；内容或媒体更新后，旧意见仍保留并标记为历史记录。</p>`}
+    ${history ? `<ol class="review-history">${history}</ol>` : records.length ? `<p class="record-output-empty">此目标暂无意见。</p>` : ""}
+    ${records.length > 3 ? `<small class="review-more-note">此目标共 ${records.length} 条；完整历史见项目制作记录。</small>` : ""}
+    <form class="review-form" data-review-form data-review-target-type="${escapeHTML(targetType)}" data-review-target-id="${escapeHTML(targetId)}">
+      <input type="hidden" name="target_revision" value="${escapeHTML(target?.revision || "")}" />
+      <div class="review-form-fields">
+        <label>结论<select name="decision" aria-label="审阅结论" ${disabled ? "disabled" : ""}><option value="revision_requested">需修改</option><option value="approved">通过</option><option value="comment">仅记录意见</option></select></label>
+        <label>问题类型<select name="category" aria-label="问题类型" ${disabled ? "disabled" : ""}>${Object.entries(reviewCategoryLabels).map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select></label>
+        ${targetType === "clip" || targetType === "final_video" ? `<label>时间码（可选）<input name="timecode" type="text" inputmode="numeric" maxlength="6" placeholder="00:12" aria-label="视频意见时间码，格式为分:秒" ${disabled ? "disabled" : ""} /></label>` : ""}
+      </div>
+      <label class="review-note-label">意见 / 修改要求<textarea name="note" rows="3" maxlength="2000" placeholder="描述具体问题、预期修改或通过依据" aria-label="审阅意见或修改要求" ${disabled ? "disabled" : ""}></textarea></label>
+      <div class="review-form-footer"><small>“通过”可不填写意见；其他结论需要填写。</small><button class="button button-subtle" type="submit" ${disabled ? "disabled" : ""}>保存审阅记录</button></div>
+    </form>
+  </section>`;
+}
+
 function renderVideoShot(shot) {
   const image = shot.image || {};
   const video = shot.video || {};
@@ -700,7 +747,28 @@ function renderVideoShot(shot) {
         ${!videoConfigured ? '<small class="shot-help">请先配置默认视频模型及 Key。</small>' : ""}
       </section>
     </div>
+    ${renderReviewPanel(state.project || {}, "clip", shot.shot_id)}
   </article>`;
+}
+
+function renderKeyframeContactSheet(shots) {
+  const frames = shots.flatMap((shot) => {
+    const image = shot.image || {};
+    if (shot.stale || image.stale_reason || image.status !== "ready" || !image.asset_url) return [];
+    const url = safeMediaUrl(image.asset_url);
+    return url ? [{ shot, url }] : [];
+  });
+  if (!frames.length) return "";
+  return `<details class="keyframe-contact-sheet">
+    <summary><strong>关键帧总览</strong><span>${frames.length} / ${shots.length} 张当前可用</span></summary>
+    <p>仅展示当前有效关键帧；已过期素材不计入。可并排检查人物、道具与色调连续性，点击缩略图在新标签页查看原图。</p>
+    <ol class="keyframe-contact-grid" aria-label="按镜头顺序排列的当前关键帧">${frames.map(({ shot, url }) => {
+      const description = shot.purpose || shot.visual_description || "关键帧";
+      return `<li><figure><a href="${url}" target="_blank" rel="noreferrer" aria-label="在新标签页打开 ${escapeHTML(shot.shot_id)} 镜头关键帧">
+        <img src="${url}" alt="${escapeHTML(shot.shot_id)} · ${escapeHTML(description)}" loading="lazy" /></a>
+        <figcaption><strong>${escapeHTML(shot.shot_id)}</strong><span>${escapeHTML(description)}</span></figcaption></figure></li>`;
+    }).join("")}</ol>
+  </details>`;
 }
 
 function renderLocalAssembly(project, shots, video) {
@@ -727,7 +795,7 @@ function renderLocalAssembly(project, shots, video) {
   const hasSubtitleText = Boolean(scenePlan?.shots?.some((shot) => shot.voiceover?.trim() || shot.screen_text?.trim()));
   const aspectOptions = [["9:16", "9:16 · 竖屏"], ["16:9", "16:9 · 横屏"], ["1:1", "1:1 · 方形"], ["4:3", "4:3"], ["3:4", "3:4"], ["2:3", "2:3"], ["3:2", "3:2"], ["21:9", "21:9 · 宽银幕"]];
   return `<section class="local-assembly-card" aria-labelledby="local-assembly-title">
-    <div class="scene-plan-heading"><div><p class="section-kicker">本机后期</p><h3 id="local-assembly-title">最终 MP4 合成</h3></div><span>${clipsReady ? "素材齐备" : `${shots.filter((shot) => shot.video?.status === "ready").length} / ${shots.length} 段可用`}</span></div>
+    <div class="scene-plan-heading"><div><p class="section-kicker">本机后期</p><h3 id="local-assembly-title" tabindex="-1">最终 MP4 合成</h3></div><span>${clipsReady ? "素材齐备" : `${shots.filter((shot) => shot.video?.status === "ready").length} / ${shots.length} 段可用`}</span></div>
     <p>仅读取已保存的本地镜头视频；按项目画幅统一缩放并补边或裁切，使用选定的 MP4 预设后在本机合成。不会调用视频生成供应商，也不会覆盖原片段。</p>
     <div class="assembly-settings-grid">
       <label for="assembly-aspect-ratio">输出画幅<select id="assembly-aspect-ratio">${aspectOptions.map(([value, label]) => `<option value="${value}" ${outputAspectRatio === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
@@ -746,6 +814,7 @@ function renderLocalAssembly(project, shots, video) {
       <button class="button button-primary" id="assemble-final-video" type="button" ${!clipsReady || busy || needsSave ? "disabled" : ""}>本机合成最终 MP4</button></div>
     ${finalVideo.status === "stale" ? `<p class="assembly-stale-note" role="status">${escapeHTML(finalVideo.stale_reason || "镜头素材或顺序已更改，请重新合成。")}</p>` : ""}
     ${finalUrl ? `<div class="video-preview"><video controls preload="metadata" src="${finalUrl}" aria-label="本地合成的最终视频"></video><p>${finalVideo.status === "ready" ? `本机合成 · ${escapeHTML(finalVideo.width || "")} × ${escapeHTML(finalVideo.height || "")} · ${escapeHTML(finalVideo.output_aspect_ratio || "")} · ${escapeHTML(finalVideo.preset || "标准")} · ${escapeHTML(finalVideo.duration_seconds || "")} 秒 · ${finalVideo.subtitles_burned ? `已烧录 ${escapeHTML(finalVideo.subtitle_cue_count || 0)} 条字幕 · ` : "未烧录字幕 · "}SHA-256 ${escapeHTML(finalVideo.sha256 || "")}` : "保留的旧版合成结果，仅供参考，当前镜头尚未重新合成。"}</p></div>` : ""}
+    ${renderReviewPanel(project, "final_video")}
   </section>`;
 }
 
@@ -761,6 +830,7 @@ function renderVideoStage(project) {
   const completed = shots.filter((shot) => shot.video?.status === "ready" && shot.video?.asset_url).length;
   return `<div class="video-production"><section class="edit-plan-card"><div class="scene-plan-heading"><div><p class="section-kicker">AI 剪辑方案</p><h3>镜头片段顺序与声音方向</h3></div><span>${completed} / ${shots.length} 段已生成</span></div>
     ${renderEditPlan(video.edit_plan || {}) || '<p class="record-output-empty">暂无剪辑说明。</p>'}<p class="video-no-merge-note">可在下方调整最终顺序，并使用本机 FFmpeg 合成；供应商仍只负责生成逐镜片段。</p></section>
+    ${renderKeyframeContactSheet(shots)}
     ${renderLocalAssembly(project, shots, video)}<div class="production-shot-list">${shots.map(renderVideoShot).join("")}</div></div>`;
 }
 
@@ -852,8 +922,537 @@ function renderRevisionHistory(item) {
         <button class="button button-subtle" type="button" data-revision-restore="${escapeHTML(revision.revision_id || "")}">恢复为当前版本</button></div></li>`).join("")}</ol></details>`;
 }
 
+function newCanvasCard(index) {
+  const used = new Set((state.canvasDraft || []).map((card) => card.shot_id));
+  let number = index + 1;
+  while (used.has(`S${String(number).padStart(2, "0")}`)) number += 1;
+  const makeId = globalThis.crypto?.randomUUID?.bind(globalThis.crypto);
+  return {
+    id: makeId ? makeId() : `shot-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    shot_id: `S${String(number).padStart(2, "0")}`,
+    title: `镜头 ${String(number).padStart(2, "0")}`,
+    duration_seconds: 5,
+    purpose: "",
+    visual_description: "",
+    camera: "",
+    voiceover: "",
+    screen_text: "",
+    transition: "",
+    continuity: "",
+  };
+}
+
+function normalizeCanvasCards(cards) {
+  if (!Array.isArray(cards)) return [];
+  return cards.slice(0, 24).map((card, index) => ({
+    ...newCanvasCard(index),
+    ...(card && typeof card === "object" ? card : {}),
+    id: typeof card?.id === "string" ? card.id : `shot-import-${index + 1}`,
+    shot_id: typeof card?.shot_id === "string" ? card.shot_id : `S${String(index + 1).padStart(2, "0")}`,
+    title: typeof card?.title === "string" ? card.title : `镜头 ${String(index + 1).padStart(2, "0")}`,
+    duration_seconds: Number.isInteger(Number(card?.duration_seconds)) ? Number(card.duration_seconds) : 5,
+    purpose: typeof card?.purpose === "string" ? card.purpose : "",
+    visual_description: typeof card?.visual_description === "string" ? card.visual_description : "",
+    camera: typeof card?.camera === "string" ? card.camera : "",
+    voiceover: typeof card?.voiceover === "string" ? card.voiceover : "",
+    screen_text: typeof card?.screen_text === "string" ? card.screen_text : "",
+    transition: typeof card?.transition === "string" ? card.transition : "",
+    continuity: typeof card?.continuity === "string" ? card.continuity : "",
+  }));
+}
+
+function openStoryboardCanvas() {
+  if (!state.project || state.project.mode !== "workflow") return;
+  const board = state.project.storyboard_canvas || {};
+  state.canvasProjectId = state.project.id;
+  state.canvasDraft = normalizeCanvasCards(board.cards);
+  state.canvasUpdatedAt = state.project.updated_at;
+  state.canvasSavedSnapshot = JSON.stringify(state.canvasDraft);
+  state.canvasRevision = 0;
+  state.canvasSavedRevision = 0;
+  state.canvasSaveError = "";
+  state.canvasConflictProject = null;
+  renderStoryboardCanvas();
+}
+
+function renderStoryboardCanvas() {
+  const project = state.project;
+  if (!project || project.id !== state.canvasProjectId) return;
+  state.viewMode = "canvas";
+  workspace.classList.remove("chat-workspace");
+  const viewToggle = document.querySelector("#view-toggle");
+  viewToggle.hidden = false;
+  viewToggle.disabled = false;
+  viewToggle.textContent = "返回创作流程";
+  document.querySelector("#top-title").textContent = `镜头画布 · ${project.title}`;
+  syncModelControl();
+
+  const cards = state.canvasDraft || [];
+  const totalDuration = cards.reduce((sum, card) => sum + (Number(card.duration_seconds) || 0), 0);
+  const cardMarkup = cards.map((card, index) => {
+    const id = `canvas-card-${index}`;
+    const field = (name, label, { textarea = false, rows = 2, maxLength = 1200, required = false } = {}) => {
+      const inputId = `${id}-${name}`;
+      const common = `id="${inputId}" data-canvas-field="${name}" data-card-index="${index}" maxlength="${maxLength}" ${name === "shot_id" ? 'pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,39}"' : ""} ${required ? "required" : ""}`;
+      return `<label class="canvas-field" for="${inputId}"><span>${label}</span>${textarea
+        ? `<textarea ${common} rows="${rows}">${escapeHTML(card[name] ?? "")}</textarea>`
+        : `<input ${common} type="text" value="${escapeHTML(card[name] ?? "")}" />`}</label>`;
+    };
+    return `<li class="canvas-card-item" data-canvas-card data-card-index="${index}">
+      <article class="canvas-card">
+        <header class="canvas-card-heading"><div><span class="canvas-shot-number">${String(index + 1).padStart(2, "0")}</span><strong>${escapeHTML(card.shot_id)}</strong></div>
+          <div class="canvas-card-actions">
+            <button class="button button-subtle canvas-icon-button" type="button" data-canvas-action="up" aria-label="将镜头 ${escapeHTML(card.shot_id)} 上移" ${index === 0 ? "disabled" : ""}>↑</button>
+            <button class="button button-subtle canvas-icon-button" type="button" data-canvas-action="down" aria-label="将镜头 ${escapeHTML(card.shot_id)} 下移" ${index === cards.length - 1 ? "disabled" : ""}>↓</button>
+            <button class="button button-subtle canvas-icon-button" type="button" data-canvas-action="remove" aria-label="删除镜头 ${escapeHTML(card.shot_id)}">×</button>
+          </div>
+        </header>
+        <div class="canvas-card-fields">
+          ${field("shot_id", "镜头编号", { maxLength: 40, required: true })}
+          ${field("title", "镜头标题", { maxLength: 120 })}
+          <label class="canvas-field" for="${id}-duration_seconds"><span>时长（秒，4–12）</span><input id="${id}-duration_seconds" data-canvas-field="duration_seconds" data-card-index="${index}" type="number" min="4" max="12" step="1" value="${escapeHTML(card.duration_seconds)}" required /></label>
+          ${field("purpose", "叙事目的", { textarea: true, maxLength: 500 })}
+          ${field("visual_description", "画面描述", { textarea: true, rows: 3, maxLength: 2000 })}
+          ${field("camera", "镜头 / 运镜", { textarea: true, maxLength: 500 })}
+          ${field("voiceover", "对白 / 旁白", { textarea: true, maxLength: 1200 })}
+          ${field("screen_text", "屏幕文字", { maxLength: 500 })}
+          ${field("transition", "转场", { maxLength: 300 })}
+          ${field("continuity", "连续性备注", { textarea: true, maxLength: 1200 })}
+        </div>
+      </article>
+    </li>`;
+  }).join("");
+
+  workspace.innerHTML = `<section class="storyboard-canvas-screen" aria-labelledby="canvas-title">
+    <header class="canvas-page-heading"><div><p class="section-kicker">手工制作 · 本地保存 · 不调用模型</p><h1 id="canvas-title">镜头画布</h1>
+      <p>直接拆镜、写画面和对白，再用上移 / 下移调整顺序。内容保存到当前项目，可导出 Markdown 交接；不请求文本、图片或视频生成服务。</p></div>
+      <div class="canvas-page-actions"><button class="button button-subtle" type="button" data-open-production-canvas>制作总览</button>
+        <button class="button button-subtle" id="export-canvas-markdown" type="button" ${cards.length ? "" : "disabled"}>下载分镜 Markdown</button>
+        <button class="button button-primary" id="add-canvas-shot" type="button" ${cards.length >= 24 ? "disabled" : ""}>＋ 添加镜头</button></div>
+    </header>
+    <div class="canvas-summary" aria-label="画布统计"><span><strong id="canvas-shot-count">${cards.length}</strong> / 24 个镜头</span><span>预计总时长 <strong id="canvas-total-duration">${totalDuration}</strong> 秒</span><span>推荐片段长度 4–12 秒</span></div>
+    <div class="canvas-save-row"><p id="canvas-save-status" role="status" aria-live="polite">${state.canvasSaveError ? escapeHTML(state.canvasSaveError) : state.canvasSavedRevision === state.canvasRevision ? "已保存到当前项目" : "有未保存的修改"}</p>
+      <div class="canvas-save-actions"><button class="button button-subtle" id="canvas-retry-save" type="button" hidden>重试保存</button>
+        <button class="button button-subtle" id="canvas-load-server" type="button" hidden>载入服务器版本</button>
+        <button class="button button-subtle" id="canvas-overwrite-server" type="button" hidden>用本地版本覆盖</button>
+        <button class="button button-subtle" id="canvas-save-now" type="button" ${state.canvasSavedRevision === state.canvasRevision ? "disabled" : ""}>立即保存</button></div>
+    </div>
+    ${cards.length ? `<ol class="storyboard-canvas-grid" aria-label="按剪辑顺序排列的镜头卡片">${cardMarkup}</ol>` : `<div class="canvas-empty"><span aria-hidden="true">＋</span><h2>从第一个镜头开始</h2><p>不需要先配置模型。添加一张卡片，手动写下画面、镜头运动、对白或屏幕文字。</p><button class="button button-primary" type="button" data-canvas-empty-add>添加第一个镜头</button></div>`}
+    <p class="canvas-footnote">这是人工编排用的 2D 分镜板，不会自动生成媒体或替代人工审核。镜头数量最多 24 个；画面文字会按普通文本保存和导出。</p>
+  </section>`;
+  bindStoryboardCanvasEvents();
+  updateCanvasSaveStatus();
+}
+
+function canvasIsDirty() {
+  return state.canvasRevision !== state.canvasSavedRevision;
+}
+
+function updateCanvasSaveStatus() {
+  const status = workspace.querySelector("#canvas-save-status");
+  if (!status) return;
+  const retry = workspace.querySelector("#canvas-retry-save");
+  const loadServer = workspace.querySelector("#canvas-load-server");
+  const overwrite = workspace.querySelector("#canvas-overwrite-server");
+  const saveNow = workspace.querySelector("#canvas-save-now");
+  const dirty = canvasIsDirty();
+  if (state.canvasConflictProject) {
+    status.textContent = "另一处已修改画布；当前本地编辑仍保留，但尚未覆盖服务器版本。请先载入服务器版本，或明确选择用本地版本覆盖。";
+  } else if (state.canvasSaveError) {
+    status.textContent = `保存失败：${state.canvasSaveError}`;
+  } else if (state.canvasSaveInFlight) {
+    status.textContent = "正在保存到本地项目…";
+  } else if (dirty) {
+    status.textContent = "有未保存的修改；正在自动保存。";
+  } else {
+    status.textContent = "已保存到当前项目。";
+  }
+  if (retry) retry.hidden = !state.canvasSaveError || Boolean(state.canvasConflictProject);
+  if (loadServer) loadServer.hidden = !state.canvasConflictProject;
+  if (overwrite) overwrite.hidden = !state.canvasConflictProject;
+  if (saveNow) saveNow.disabled = !dirty || state.canvasSaveInFlight || Boolean(state.canvasConflictProject);
+}
+
+function scheduleCanvasSave(delay = 650) {
+  if (state.canvasConflictProject) return;
+  if (state.canvasSaveTimer) clearTimeout(state.canvasSaveTimer);
+  state.canvasSaveTimer = setTimeout(() => {
+    state.canvasSaveTimer = null;
+    saveStoryboardCanvas();
+  }, delay);
+  updateCanvasSaveStatus();
+}
+
+function markCanvasDirty() {
+  state.canvasRevision += 1;
+  state.canvasSaveError = "";
+  updateCanvasSaveStatus();
+  scheduleCanvasSave();
+}
+
+async function saveStoryboardCanvas() {
+  if (state.canvasSaveTimer) {
+    clearTimeout(state.canvasSaveTimer);
+    state.canvasSaveTimer = null;
+  }
+  if (!state.canvasProjectId || !state.project) return false;
+  if (!canvasIsDirty()) return true;
+  if (state.canvasConflictProject) return false;
+  if (state.canvasSaveInFlight) {
+    state.canvasSaveQueued = true;
+    return false;
+  }
+  const invalidField = [...workspace.querySelectorAll("[data-canvas-field]")].find((field) => !field.checkValidity());
+  if (invalidField) {
+    state.canvasSaveError = "请先修正画布字段中的无效值。";
+    updateCanvasSaveStatus();
+    invalidField.reportValidity();
+    invalidField.focus();
+    return false;
+  }
+
+  const projectId = state.canvasProjectId;
+  const expectedUpdatedAt = state.canvasUpdatedAt || state.project.updated_at;
+  const revision = state.canvasRevision;
+  const cards = JSON.parse(JSON.stringify(state.canvasDraft));
+  state.canvasSaveInFlight = true;
+  state.canvasSaveQueued = false;
+  updateCanvasSaveStatus();
+  try {
+    const saved = await api(`/api/projects/${encodeURIComponent(projectId)}/storyboard-canvas`, {
+      method: "PUT",
+      body: JSON.stringify({ expected_updated_at: expectedUpdatedAt, cards }),
+    });
+    if (state.canvasProjectId === projectId) {
+      state.canvasUpdatedAt = saved.updated_at;
+      state.canvasSavedSnapshot = JSON.stringify(saved.storyboard_canvas?.cards || cards);
+      state.canvasSavedRevision = revision;
+      state.canvasSaveError = "";
+      state.canvasConflictProject = null;
+      if (state.project?.id === projectId) {
+        state.project.updated_at = saved.updated_at;
+        state.project.storyboard_canvas = saved.storyboard_canvas;
+      }
+    }
+  } catch (error) {
+    if (error.status === 409 && state.canvasProjectId === projectId) {
+      try {
+        const latest = await api(`/api/projects/${encodeURIComponent(projectId)}`);
+        const latestCards = normalizeCanvasCards(latest.storyboard_canvas?.cards);
+        if (JSON.stringify(latestCards) === state.canvasSavedSnapshot) {
+          state.canvasUpdatedAt = latest.updated_at;
+          if (state.project?.id === projectId) state.project.updated_at = latest.updated_at;
+          state.canvasSaveError = "";
+          state.canvasSaveQueued = true;
+        } else {
+          state.canvasConflictProject = latest;
+          state.canvasSaveError = "";
+        }
+      } catch (refreshError) {
+        state.canvasSaveError = refreshError.message || error.message;
+      }
+    } else if (state.canvasProjectId === projectId) {
+      state.canvasSaveError = error.message;
+    }
+  } finally {
+    state.canvasSaveInFlight = false;
+    if (state.canvasProjectId === projectId) updateCanvasSaveStatus();
+    const needsSave = state.canvasProjectId === projectId && canvasIsDirty() && !state.canvasConflictProject;
+    const queued = state.canvasSaveQueued;
+    state.canvasSaveQueued = false;
+    if (needsSave && !state.canvasSaveError && (queued || state.canvasSavedRevision !== state.canvasRevision)) scheduleCanvasSave(queued ? 0 : 650);
+  }
+  return state.canvasProjectId !== projectId || !canvasIsDirty();
+}
+
+async function resolveCanvasConflict(action) {
+  const latest = state.canvasConflictProject;
+  if (!latest || state.canvasProjectId !== latest.id) return;
+  if (action === "load") {
+    const confirmed = await confirmInApp({
+      title: "载入服务器画布并放弃本地修改？",
+      message: "当前页面里未保存的镜头内容将被服务器版本替换。若要保留当前版本，请先下载 Markdown。",
+      confirmLabel: "载入服务器版本",
+    });
+    if (!confirmed) return;
+    state.project = latest;
+    state.canvasDraft = normalizeCanvasCards(latest.storyboard_canvas?.cards);
+    state.canvasUpdatedAt = latest.updated_at;
+    state.canvasSavedSnapshot = JSON.stringify(state.canvasDraft);
+    state.canvasRevision = 0;
+    state.canvasSavedRevision = 0;
+    state.canvasConflictProject = null;
+    state.canvasSaveError = "";
+    renderStoryboardCanvas();
+    return;
+  }
+  const confirmed = await confirmInApp({
+    title: "覆盖服务器上的分镜画布？",
+    message: "服务器画布将被当前页面的本地编辑替换；镜头内容不会合并。",
+    confirmLabel: "覆盖服务器画布",
+  });
+  if (!confirmed) return;
+  state.canvasUpdatedAt = latest.updated_at;
+  if (state.project?.id === latest.id) state.project.updated_at = latest.updated_at;
+  state.canvasConflictProject = null;
+  state.canvasSaveError = "";
+  scheduleCanvasSave(0);
+}
+
+function escapeCanvasMarkdown(value) {
+  const replacements = {
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\\": "\\\\", "`": "\\`", "*": "\\*",
+    "_": "\\_", "{": "\\{", "}": "\\}", "[": "\\[", "]": "\\]", "(": "\\(", ")": "\\)",
+    "#": "\\#", "+": "\\+", "-": "\\-", ".": "\\.", "!": "\\!", "|": "\\|", "~": "\\~",
+  };
+  return Array.from(String(value ?? "").replace(/\r\n?/g, "\n"), (character) => replacements[character] ?? character).join("");
+}
+
+function downloadStoryboardCanvas() {
+  const cards = state.canvasDraft || [];
+  if (!cards.length) return;
+  const title = escapeCanvasMarkdown(state.project?.title || "未命名项目");
+  const lines = [`# ${title} · 手工分镜`, "", `> ${cards.length} 个镜头 · 预计 ${cards.reduce((sum, card) => sum + Number(card.duration_seconds || 0), 0)} 秒 · 本地手工编排，未调用模型`, ""];
+  const labels = [
+    ["叙事目的", "purpose"], ["画面描述", "visual_description"], ["镜头 / 运镜", "camera"],
+    ["对白 / 旁白", "voiceover"], ["屏幕文字", "screen_text"], ["转场", "transition"], ["连续性备注", "continuity"],
+  ];
+  cards.forEach((card, index) => {
+    const shotId = escapeCanvasMarkdown(card.shot_id || `S${String(index + 1).padStart(2, "0")}`);
+    const shotTitle = escapeCanvasMarkdown(card.title || "未命名镜头");
+    lines.push(`## ${String(index + 1).padStart(2, "0")} · ${shotId} · ${shotTitle}`, "", `- 时长：${card.duration_seconds} 秒`);
+    for (const [label, key] of labels) {
+      const value = String(card[key] || "").trim();
+      if (!value) continue;
+      lines.push(`- ${label}：`, "");
+      for (const line of escapeCanvasMarkdown(value).split("\n")) lines.push(line ? `> ${line}` : ">");
+      lines.push("");
+    }
+    lines.push("");
+  });
+  const filename = (state.project?.title || "storyboard").replace(/[\\/:*?"<>|\s]+/g, "-").slice(0, 60) || "storyboard";
+  const url = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${filename}-storyboard.md`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function bindStoryboardCanvasEvents() {
+  workspace.querySelectorAll("[data-canvas-field]").forEach((field) => {
+    field.addEventListener("input", () => {
+      const index = Number(field.dataset.cardIndex);
+      const card = state.canvasDraft[index];
+      if (!card) return;
+      card[field.dataset.canvasField] = field.dataset.canvasField === "duration_seconds" ? Number(field.value) : field.value;
+      const heading = field.closest("[data-canvas-card]")?.querySelector(".canvas-card-heading strong");
+      if (heading && field.dataset.canvasField === "shot_id") heading.textContent = field.value;
+      updateCanvasTotals();
+      markCanvasDirty();
+    });
+  });
+  workspace.querySelectorAll("[data-canvas-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const item = button.closest("[data-canvas-card]");
+      const index = Number(item?.dataset.cardIndex);
+      if (!Number.isInteger(index) || !state.canvasDraft[index]) return;
+      const action = button.dataset.canvasAction;
+      const card = state.canvasDraft[index];
+      if (action === "remove") {
+        const confirmed = await confirmInApp({
+          title: `删除镜头 ${card.shot_id}？`,
+          message: "此卡片会从分镜画布中移除；已下载的 Markdown 文件不会改变。",
+          confirmLabel: "删除镜头",
+        });
+        if (!confirmed) return;
+        state.canvasDraft.splice(index, 1);
+      } else {
+        const next = index + (action === "up" ? -1 : 1);
+        if (next < 0 || next >= state.canvasDraft.length) return;
+        [state.canvasDraft[index], state.canvasDraft[next]] = [state.canvasDraft[next], state.canvasDraft[index]];
+      }
+      markCanvasDirty();
+      renderStoryboardCanvas();
+      const focusIndex = Math.min(index, state.canvasDraft.length - 1);
+      if (focusIndex >= 0) workspace.querySelector(`[data-canvas-card][data-card-index="${focusIndex}"] input[data-canvas-field="shot_id"]`)?.focus();
+    });
+  });
+  const addCard = () => {
+    if (state.canvasDraft.length >= 24) return;
+    const card = newCanvasCard(state.canvasDraft.length);
+    state.canvasDraft.push(card);
+    markCanvasDirty();
+    renderStoryboardCanvas();
+    workspace.querySelector(`[data-canvas-card][data-card-index="${state.canvasDraft.length - 1}"] input[data-canvas-field="title"]`)?.focus();
+  };
+  workspace.querySelectorAll("#add-canvas-shot, [data-canvas-empty-add]").forEach((button) => button.addEventListener("click", addCard));
+  workspace.querySelector("[data-open-production-canvas]")?.addEventListener("click", openProductionCanvas);
+  workspace.querySelector("#export-canvas-markdown")?.addEventListener("click", downloadStoryboardCanvas);
+  workspace.querySelector("#canvas-save-now")?.addEventListener("click", saveStoryboardCanvas);
+  workspace.querySelector("#canvas-retry-save")?.addEventListener("click", saveStoryboardCanvas);
+  workspace.querySelector("#canvas-load-server")?.addEventListener("click", () => resolveCanvasConflict("load"));
+  workspace.querySelector("#canvas-overwrite-server")?.addEventListener("click", () => resolveCanvasConflict("overwrite"));
+}
+
+function updateCanvasTotals() {
+  const count = workspace.querySelector("#canvas-shot-count");
+  const duration = workspace.querySelector("#canvas-total-duration");
+  if (count) count.textContent = String(state.canvasDraft.length);
+  if (duration) duration.textContent = String(state.canvasDraft.reduce((sum, card) => sum + (Number(card.duration_seconds) || 0), 0));
+  const add = workspace.querySelector("#add-canvas-shot");
+  if (add) add.disabled = state.canvasDraft.length >= 24;
+}
+
+function productionCanvasStageClass(item, stageId, activeIndex) {
+  if (item?.status === "approved") return "complete";
+  if (item?.status === "ready") return "current";
+  if (item?.status === "stale") return "stale";
+  const index = state.config.stages.findIndex((stage) => stage.id === stageId);
+  return index >= 0 && index <= activeIndex ? "current" : "waiting";
+}
+
+function productionCanvasStageButton(stageId, label, { disabled = false, focus = "", primary = false } = {}) {
+  return `<button class="button ${primary ? "button-primary" : "button-subtle"}" type="button" data-production-stage="${escapeHTML(stageId)}" ${focus ? `data-production-focus="${escapeHTML(focus)}"` : ""} ${disabled ? "disabled" : ""}>${escapeHTML(label)}</button>`;
+}
+
+function productionCanvasStep({ number, title, status, summary, stateClass, actions }) {
+  const validState = ["complete", "current", "stale", "waiting", "available"].includes(stateClass) ? stateClass : "waiting";
+  return `<li class="production-flow-step is-${validState}"><article class="production-flow-node">
+    <div class="production-flow-meta"><span class="production-flow-number">${String(number).padStart(2, "0")}</span><span class="production-flow-status">${escapeHTML(status)}</span></div>
+    <h3>${escapeHTML(title)}</h3><p>${escapeHTML(summary)}</p><div class="production-flow-actions">${actions}</div>
+  </article></li>`;
+}
+
+function renderProductionShotPreview(shot, index, manualCards, videoShots) {
+  const shotId = String(shot.shot_id || `S${String(index + 1).padStart(2, "0")}`);
+  const manual = manualCards.find((card) => card.shot_id === shotId) || {};
+  const asset = videoShots.find((item) => item.shot_id === shotId) || shot;
+  const title = manual.title || shot.purpose || `镜头 ${shotId}`;
+  const description = manual.visual_description || shot.visual_description || manual.purpose || shot.purpose || "尚未填写画面描述。";
+  const duration = Number(shot.duration_seconds || manual.duration_seconds || 0);
+  const imageStatus = asset.image ? assetStatusLabel(asset.image) : "待生成";
+  const videoStatus = asset.video ? assetStatusLabel(asset.video) : "待生成";
+  return `<li class="production-shot-card"><div class="production-shot-frame" aria-hidden="true"><span>${escapeHTML(shotId)}</span><span>${duration ? `${escapeHTML(duration)} 秒` : "时长待定"}</span><i></i><b></b></div>
+    <div class="production-shot-copy"><p class="section-kicker">镜头 ${String(index + 1).padStart(2, "0")}</p><h3>${escapeHTML(title)}</h3><p>${escapeHTML(description)}</p>
+      <div class="production-shot-status"><span>关键帧 · ${escapeHTML(imageStatus)}</span><span>片段 · ${escapeHTML(videoStatus)}</span></div></div></li>`;
+}
+
+function renderProductionCanvas(project) {
+  if (!project || project.mode !== "workflow") return;
+  state.viewMode = "production-canvas";
+  workspace.classList.remove("chat-workspace");
+  const viewToggle = document.querySelector("#view-toggle");
+  viewToggle.hidden = false;
+  viewToggle.disabled = false;
+  viewToggle.textContent = "返回创作流程";
+  document.querySelector("#top-title").textContent = `2D 制作预演 · ${project.title}`;
+  syncModelControl();
+
+  const workflow = project.workflow || {};
+  const brief = project.brief || {};
+  const activeIndex = state.config.stages.findIndex((stage) => stage.id === project.active_stage);
+  const unlocked = (stageId) => {
+    const index = state.config.stages.findIndex((stage) => stage.id === stageId);
+    return index >= 0 && index <= activeIndex;
+  };
+  const script = workflow.script || {};
+  const prompt = workflow.prompt || {};
+  const storyboard = workflow.storyboard || {};
+  const scenes = workflow.scenes || {};
+  const video = workflow.video || {};
+  const videoShots = Array.isArray(video.shots) ? video.shots : [];
+  const scenePlan = parseScenePlan(scenes.content || "");
+  const sceneShots = scenePlan?.shots || [];
+  const manualCards = Array.isArray(project.storyboard_canvas?.cards) ? project.storyboard_canvas.cards : [];
+  const subtitleShotCount = sceneShots.filter((shot) => String(shot.voiceover || "").trim() || String(shot.screen_text || "").trim()).length;
+  const imagesReady = videoShots.filter((shot) => shot.image?.status === "ready" && shot.image?.asset_url).length;
+  const videosReady = videoShots.filter((shot) => shot.video?.status === "ready" && shot.video?.asset_url).length;
+  const finalVideo = video.final_video || {};
+  const finalReady = finalVideo.status === "ready" && Boolean(finalVideo.asset_url);
+  const assetTarget = videoShots.length ? "video" : "scenes";
+  const assetTargetLabel = videoShots.length ? "查看逐镜素材" : "准备镜头任务";
+  const projectSummary = [brief.product, brief.platform, brief.duration_seconds ? `${brief.duration_seconds} 秒` : "", brief.style].filter(Boolean).join(" · ");
+  const sceneSummary = `视觉设定：${productionStageStatus(project, "prompt")} · 分镜：${productionStageStatus(project, "storyboard")} · 镜头任务：${productionStageStatus(project, "scenes")}`;
+  const assetSummary = videoShots.length
+    ? `${videoShots.length} 个镜头 · 关键帧 ${imagesReady}/${videoShots.length} · 视频片段 ${videosReady}/${videoShots.length}`
+    : sceneShots.length ? `${sceneShots.length} 个镜头任务已记录，尚未生成逐镜素材` : "确认镜头任务后，可逐镜准备关键帧和视频片段";
+  const editStatus = finalReady ? "最终成片已就绪" : finalVideo.status === "stale" ? "最终成片需重新合成" : videosReady ? "素材可用于本机合成" : "等待逐镜视频片段";
+  const editSummary = `${editStatus} · ${subtitleShotCount ? `${subtitleShotCount} 个镜头含口播或屏幕文字` : "当前镜头任务没有字幕文本"}`;
+  const steps = [
+    productionCanvasStep({ number: 1, title: "项目设定", status: "已建立", summary: projectSummary || project.title || "创作目标已保存", stateClass: "complete", actions: productionCanvasStageButton("script", "继续到脚本", { primary: true }) }),
+    productionCanvasStep({ number: 2, title: "脚本", status: productionStageStatus(project, "script"), summary: script.content ? `当前稿件约 ${script.content.length} 字，可回到工作流继续编辑和审阅。` : "从项目目标开始起草，并在进入分镜前确认内容。", stateClass: productionCanvasStageClass(script, "script", activeIndex), actions: productionCanvasStageButton("script", script.content ? "查看 / 编辑脚本" : "打开脚本步骤", { disabled: !unlocked("script") }) }),
+    productionCanvasStep({ number: 3, title: "分镜预演", status: productionStageStatus(project, "storyboard"), summary: `${sceneSummary} · 手工画布 ${manualCards.length} 镜`, stateClass: productionCanvasStageClass(storyboard, "storyboard", activeIndex), actions: `${productionCanvasStageButton("storyboard", "打开分镜步骤", { disabled: !unlocked("storyboard") })}<button class="button button-subtle" type="button" data-open-manual-storyboard>打开手工分镜</button>` }),
+    productionCanvasStep({ number: 4, title: "逐镜素材", status: videoShots.length ? `${videosReady}/${videoShots.length} 段视频片段` : productionStageStatus(project, "scenes"), summary: assetSummary, stateClass: videosReady && videosReady === videoShots.length ? "complete" : videoShots.length || sceneShots.length ? "current" : productionCanvasStageClass(scenes, "scenes", activeIndex), actions: productionCanvasStageButton(assetTarget, assetTargetLabel, { disabled: !unlocked(assetTarget), primary: true }) }),
+    productionCanvasStep({ number: 5, title: "剪辑 / 字幕", status: finalReady ? "本机合成已完成" : editStatus, summary: editSummary, stateClass: finalReady ? "complete" : finalVideo.status === "stale" ? "stale" : videosReady ? "current" : "waiting", actions: productionCanvasStageButton("video", "打开剪辑与字幕", { disabled: !unlocked("video"), focus: "assembly" }) }),
+    productionCanvasStep({ number: 6, title: "交付", status: finalReady ? "成片可交付" : "可打包当前资料", summary: "导出本地制作交付包，包含项目资料、审阅记录与可用媒体；下载由你主动发起。", stateClass: finalReady ? "complete" : "available", actions: `<a class="button button-primary" href="/api/projects/${encodeURIComponent(project.id)}/delivery">下载制作交付包</a>` }),
+  ].join("");
+  const previewShots = videoShots.length ? videoShots : sceneShots.length ? sceneShots : manualCards;
+  const shotSource = videoShots.length ? "当前逐镜素材任务" : sceneShots.length ? "已确认镜头任务" : manualCards.length ? "手工分镜卡片" : "等待分镜内容";
+  const shotMarkup = previewShots.map((shot, index) => renderProductionShotPreview(shot, index, manualCards, videoShots)).join("");
+  const previewShotIds = new Set(previewShots.map((shot) => shot.shot_id));
+  const unlinkedManualCards = manualCards.filter((card) => !previewShotIds.has(card.shot_id));
+  const unlinkedManualMarkup = unlinkedManualCards.map((card, index) => renderProductionShotPreview(card, index, manualCards, videoShots)).join("");
+
+  workspace.innerHTML = `<section class="production-canvas-screen" aria-labelledby="production-canvas-title">
+    <div class="production-canvas-toolbar"><button class="record-back-button" type="button" data-production-back><span aria-hidden="true">←</span> 返回创作流程</button><a class="button button-subtle" href="/api/projects/${encodeURIComponent(project.id)}/delivery">下载制作交付包</a></div>
+    <header class="production-canvas-heading"><p class="section-kicker">2D 预演画布 · 项目本地数据</p><h1 id="production-canvas-title" tabindex="-1">从项目设定到交付</h1>
+      <p>${escapeHTML(project.title)} 的制作状态总览。节点数据直接读取现有工作流；修改在原阶段保存，离开画布后可继续。这里不调用文本、图像或视频生成服务。</p></header>
+    <section class="production-flow-panel" aria-labelledby="production-flow-title"><div class="production-panel-heading"><div><p class="section-kicker">全流程</p><h2 id="production-flow-title">制作路径</h2></div><span>按编号沿路径预演</span></div>
+      <ol class="production-flow-map" aria-label="项目设定、脚本、分镜、逐镜素材、剪辑字幕与交付">${steps}</ol>
+    </section>
+    <section class="production-shot-panel" aria-labelledby="production-shot-title"><div class="production-panel-heading"><div><p class="section-kicker">镜头顺序 · ${escapeHTML(shotSource)}</p><h2 id="production-shot-title">2D 镜头预演带</h2></div>
+      <button class="button button-subtle" type="button" data-open-manual-storyboard>打开手工分镜</button></div>
+      ${shotMarkup ? `<ol class="production-shot-track" aria-label="按顺序排列的镜头与逐镜素材">${shotMarkup}</ol>` : `<div class="production-shot-empty"><span aria-hidden="true">▧</span><div><strong>镜头还没有进入预演带</strong><p>可先手工添加分镜卡片，或完成工作流中的镜头任务。手工分镜只保存在本项目，不会触发生成。</p></div><button class="button button-primary" type="button" data-open-manual-storyboard>添加手工分镜</button></div>`}
+      ${unlinkedManualMarkup ? `<div class="production-manual-shot-panel"><h3>独立手工分镜 · 不自动同步</h3><p>这些卡片未与工作流逐镜任务按镜头编号关联；可在手工分镜画布继续编辑。</p><ol class="production-shot-track" aria-label="未关联到工作流的手工分镜">${unlinkedManualMarkup}</ol></div>` : ""}
+    </section>
+    <p class="production-canvas-footnote">状态是工作流数据的可视化摘要，不代表质量验收。手工分镜、逐镜素材、剪辑和交付仍按原流程分别保存；未生成的素材不会被自动补齐。</p>
+  </section>`;
+  workspace.querySelector("[data-production-back]")?.addEventListener("click", () => {
+    state.viewStage = state.viewStage || project.active_stage;
+    renderProject();
+    workspace.querySelector("#stage-title")?.focus();
+  });
+  workspace.querySelectorAll("[data-production-stage]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const stageId = button.dataset.productionStage;
+      const stageIndex = state.config.stages.findIndex((stage) => stage.id === stageId);
+      if (stageIndex < 0 || stageIndex > activeIndex) return;
+      state.viewStage = stageId;
+      renderProject();
+      const focus = button.dataset.productionFocus;
+      if (focus === "assembly") {
+        const heading = workspace.querySelector("#local-assembly-title");
+        heading?.focus();
+        heading?.scrollIntoView({ behavior: "smooth", block: "start" });
+      } else {
+        workspace.querySelector("#stage-title")?.focus();
+      }
+    });
+  });
+  workspace.querySelectorAll("[data-open-manual-storyboard]").forEach((button) => button.addEventListener("click", openStoryboardCanvas));
+  workspace.querySelector("#production-canvas-title")?.focus({ preventScroll: true });
+}
+
+async function openProductionCanvas() {
+  if (!state.project || state.project.mode !== "workflow") return;
+  if (!(await ensureCanvasSavedBeforeNavigation())) return;
+  const editor = state.viewMode === "workflow" ? workspace.querySelector("#stage-content") : null;
+  const currentContent = state.project.workflow?.[state.viewStage]?.content || "";
+  if (editor && editor.value !== currentContent) {
+    const discard = await confirmInApp({
+      title: "放弃未保存的修改？",
+      message: "进入制作预演画布前，当前阶段的未保存编辑将丢失。",
+      confirmLabel: "放弃修改并继续",
+    });
+    if (!discard) return;
+  }
+  renderProductionCanvas(state.project);
+}
+
 function renderProject() {
   if (!state.project) return renderChatScreen();
+  if (state.project.mode === "workflow" && !state.project.review_targets) hydrateReviewData();
   state.viewMode = "workflow";
   workspace.classList.remove("chat-workspace");
   const project = state.project;
@@ -893,6 +1492,7 @@ function renderProject() {
     contentArea = readOnlyContent;
   } else if ((item.status === "ready" || item.status === "stale") && isCurrent) {
     contentArea = `${item.status === "stale" ? `<p class="stage-stale-note" role="status">${escapeHTML(item.stale_reason || "上游内容已修改。")}</p>` : ""}
+      ${item.validation_error ? `<p id="stage-validation-note" class="stage-stale-note" role="alert">镜头任务未通过 JSON 校验；原始输出已保留在编辑框中。请修正并保存后再确认。${escapeHTML(item.validation_error)}</p>` : ""}
       <div class="content-toolbar">
         <label class="content-label" for="stage-content">${viewStage === "scenes" ? "逐镜任务 JSON" : "审阅草稿"}</label>
         <div class="content-view-switch" role="group" aria-label="草稿显示方式">
@@ -927,7 +1527,7 @@ function renderProject() {
       : item.status === "approved"
         ? `<span class="approved-badge">✓ 已确认</span>`
         : item.status === "ready"
-          ? `<div class="stage-footer-actions"><button class="button button-subtle" id="regenerate-stage" type="button">重新生成草稿</button><button class="button button-primary" id="approve-stage" type="button">确认${escapeHTML(stage.label)}，继续</button></div>`
+          ? `<div class="stage-footer-actions"><button class="button button-subtle" id="regenerate-stage" type="button">重新生成草稿</button><button class="button button-primary" id="approve-stage" type="button" ${item.validation_error ? 'disabled aria-describedby="stage-validation-note"' : ""}>确认${escapeHTML(stage.label)}，继续</button></div>`
           : item.status === "stale" && isCurrent
             ? `<button class="button button-primary" id="regenerate-stage" type="button">重新生成草稿</button>`
             : isCurrent
@@ -940,19 +1540,25 @@ function renderProject() {
         <h1>${escapeHTML(project.title)}</h1>
         ${project.series_id ? `<p class="project-series-note">EP${String(project.episode_number || 0).padStart(2, "0")} · ${escapeHTML(linkedSeries?.title || "所属故事系列")}</p>` : ""}
         <p class="project-description">${escapeHTML(project.brief.business)} · 面向 ${escapeHTML(project.brief.audience)}</p></div>
-      <div class="project-state"><span class="state-dot" aria-hidden="true"></span>当前步骤：${escapeHTML(stageLabel(project.active_stage))}</div>
+      <div class="project-heading-actions"><div class="project-state"><span class="state-dot" aria-hidden="true"></span>当前步骤：${escapeHTML(stageLabel(project.active_stage))}</div>
+        <button class="button button-subtle" type="button" data-open-production-canvas>2D 制作预演</button>
+        <button class="button button-subtle" type="button" data-open-storyboard-canvas>打开手工分镜画布</button></div>
     </div>
     <nav class="stage-rail" aria-label="创作步骤">${stepButtons}</nav>
     <section class="stage-panel" aria-labelledby="stage-title">
       <div class="stage-panel-heading"><div><p class="section-kicker">${escapeHTML(statusLabel(item, viewIndex, activeIndex))}</p>
-        <h2 id="stage-title">${escapeHTML(stage.label)}</h2><p>${escapeHTML(stage.purpose)}</p></div><span class="stage-time">${escapeHTML(project.brief.duration_seconds)} 秒${project.track === "drama" ? "单集目标" : "目标"}时长</span></div>
+        <h2 id="stage-title" tabindex="-1">${escapeHTML(stage.label)}</h2><p>${escapeHTML(stage.purpose)}</p></div><span class="stage-time">${escapeHTML(project.brief.duration_seconds)} 秒${project.track === "drama" ? "单集目标" : "目标"}时长</span></div>
       ${viewStage === "script" ? `<div class="brief-strip"><strong>${project.track === "drama" ? "作品 / 项目名" : "产品 / 服务"}</strong><span>${escapeHTML(project.brief.product)}</span><strong>${project.track === "drama" ? "媒介 / 风格" : "风格"}</strong><span>${escapeHTML(project.brief.style)}</span></div>` : ""}
       <div class="stage-content">${contentArea}</div>
+      ${viewStage === "script" || viewStage === "storyboard" ? renderReviewPanel(project, viewStage) : ""}
       ${editorContent && !isVideo ? '<div class="quality-check-bar"><button class="button button-subtle" id="run-quality-check" type="button">运行质量检查</button><div id="quality-results" class="quality-results" role="status" aria-live="polite"></div></div>' : ""}
       <div class="stage-footer"><span class="footer-hint">${isVideo ? "镜头片段由供应商单独生成（可能产生费用）；最终 MP4 可在本机合成，不会调用媒体供应商。" : "已确认步骤可回退修改；后续内容会保留并标记为过期，重新审阅后再继续。"}</span>${action}</div>
     </section>
     <p class="workspace-footnote">文本模型：${escapeHTML(modelName(project.model))} <span aria-hidden="true">·</span> 本地技能：${state.skillCount ?? 0} 个</p>`;
 
+  workspace.querySelectorAll("[data-review-form]").forEach((form) => {
+    form.addEventListener("submit", submitProjectReview);
+  });
   workspace.querySelectorAll("[data-stage]").forEach((button) => {
     button.addEventListener("click", async () => {
       if (stageEditor && stageEditor.value !== (item.content || "")) {
@@ -981,6 +1587,8 @@ function renderProject() {
   workspace.querySelectorAll("[data-revision-restore]").forEach((button) => {
     button.addEventListener("click", () => restoreStageRevision(viewStage, button.dataset.revisionRestore));
   });
+  workspace.querySelector("[data-open-storyboard-canvas]")?.addEventListener("click", openStoryboardCanvas);
+  workspace.querySelector("[data-open-production-canvas]")?.addEventListener("click", openProductionCanvas);
   workspace.querySelector("#run-quality-check")?.addEventListener("click", runStageQualityCheck);
   workspace.querySelector("#preview-stage-view")?.addEventListener("click", (event) => {
     stagePreview.innerHTML = viewStage === "scenes" ? renderScenePlanPreview(stageEditor.value) : renderMarkdown(stageEditor.value);
@@ -1196,7 +1804,7 @@ function renderProductionRecords() {
         ${recordArtifactButton(project, "storyboard", "分镜")}
         ${recordArtifactButton(project, "video", "视频片段")}
       </div>
-      <footer class="record-card-footer"><span>最近更新 ${escapeHTML(recordDate(project.updated_at))}</span>
+      <footer class="record-card-footer"><span>最近更新 ${escapeHTML(recordDate(project.updated_at))}${(project.review_count || project.review_records?.length) ? ` · ${project.review_count || project.review_records.length} 条审阅` : ""}</span>
         <button class="record-open-button" type="button" data-open-record="${escapeHTML(project.id)}">查看产物 <span aria-hidden="true">↗</span></button>
       </footer>
     </article>`;
@@ -1231,7 +1839,8 @@ function renderProductionRecords() {
   });
   workspace.querySelector("#import-project")?.addEventListener("click", () => workspace.querySelector("#project-import-file")?.click());
   workspace.querySelector("#project-import-file")?.addEventListener("change", (event) => importProjectBundleFromFile(event.currentTarget));
-  workspace.querySelector("#records-new-workflow, #record-empty-new-workflow")?.addEventListener("click", () => {
+  workspace.querySelector("#records-new-workflow, #record-empty-new-workflow")?.addEventListener("click", async () => {
+    if (!(await ensureCanvasSavedBeforeNavigation())) return;
     state.project = null;
     state.viewStage = null;
     showNotice("");
@@ -1263,6 +1872,7 @@ function recordContentCard(project, stageId, label) {
 }
 
 function renderProductionRecordDetail(project) {
+  if (project.mode === "workflow" && !project.review_targets) hydrateReviewData();
   state.viewMode = "record-detail";
   workspace.classList.remove("chat-workspace");
   document.querySelector("#top-title").textContent = project.title || "制作记录";
@@ -1288,6 +1898,12 @@ function renderProductionRecordDetail(project) {
     : recordedShotMedia
       ? `<div class="record-shot-list">${recordedShotMedia}</div>`
       : `<div class="record-output-empty">尚无已生成的关键帧或视频片段。确认镜头任务后，可逐镜调用模型生成。</div>`;
+  const finalVideo = video.final_video || {};
+  const finalVideoUrl = finalVideo.asset_url ? safeMediaUrl(finalVideo.asset_url) : "";
+  const finalVideoCard = `<article class="record-output-card record-final-video-card"><header><div><p class="section-kicker">${escapeHTML(assetStatusLabel(finalVideo))}</p><h2>最终视频</h2></div>
+      <button class="button button-subtle" type="button" data-record-stage="video" ${finalVideoUrl ? "" : "disabled"}>在工作流中打开</button></header>
+      ${finalVideoUrl ? `<video controls preload="metadata" src="${finalVideoUrl}" aria-label="${escapeHTML(project.title)} 最终视频"></video><p>${escapeHTML(finalVideo.duration_seconds || "—")} 秒 · ${escapeHTML(finalVideo.width || "—")} × ${escapeHTML(finalVideo.height || "—")} · SHA-256 ${escapeHTML(finalVideo.sha256 || "未知")}</p>` : '<p class="record-output-empty">暂无当前可播放的本机合成成片。</p>'}
+      ${renderReviewPanel(project, "final_video")}</article>`;
   const editPlan = renderEditPlan(video.edit_plan || project.workflow?.scenes?.edit_plan || {});
   const editPlanContent = editPlan ? `<section class="record-edit-plan"><h3>AI 剪辑方案（未合并）</h3>${editPlan}</section>` : "";
 
@@ -1307,7 +1923,9 @@ function renderProductionRecordDetail(project) {
       <article class="record-output-card record-video-card"><header><div><p class="section-kicker">${escapeHTML(productionStageStatus(project, "video"))}</p><h2>逐镜视频片段</h2></div>
         <button class="button button-subtle" type="button" data-record-stage="video" ${shotStats.hasAssets || videoUrl ? "" : "disabled"}>在工作流中打开</button></header>
         ${videoContent}${editPlanContent}</article>
+      ${finalVideoCard}
     </div>
+    ${renderReviewTimeline(project)}
     <p class="record-detail-updated">最近更新：${escapeHTML(recordDate(project.updated_at))}</p>
   </section>`;
 
@@ -1322,9 +1940,116 @@ function renderProductionRecordDetail(project) {
       renderProject();
     });
   });
+  workspace.querySelectorAll("[data-review-form]").forEach((form) => {
+    form.addEventListener("submit", submitProjectReview);
+  });
+  workspace.querySelectorAll("[data-review-open-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.viewStage = ["script", "storyboard"].includes(button.dataset.reviewOpenTarget) ? button.dataset.reviewOpenTarget : "video";
+      renderProject();
+    });
+  });
+}
+
+function renderReviewTimeline(project) {
+  const records = project.review_records || [];
+  const entries = records.map((record) => `<li class="project-review-entry">
+    <div class="review-history-meta"><strong>${escapeHTML(record.target_label || "项目内容")}</strong><span>${escapeHTML(reviewDecisionLabels[record.decision] || "意见")}</span><span>${escapeHTML(reviewCategoryLabels[record.category] || record.category || "综合")}</span>${record.timecode ? `<span>时间码 ${escapeHTML(record.timecode)}</span>` : ""}<time>${escapeHTML(recordDate(record.created_at))}</time><span class="review-version-badge ${record.is_current ? "" : "is-historical"}">${record.is_current ? "当前版本" : "历史版本"}</span></div>
+    ${record.note ? `<p>${escapeHTML(record.note)}</p>` : "<p>确认通过。</p>"}
+    <button class="button button-subtle" type="button" data-review-open-target="${escapeHTML(record.target_type)}" data-review-open-id="${escapeHTML(record.target_id || "")}">打开对应阶段</button>
+  </li>`).join("");
+  return `<section class="project-review-timeline" aria-labelledby="project-review-title"><div class="review-panel-heading"><div><p class="section-kicker">项目历史 · 按版本留存</p><h2 id="project-review-title">审阅记录</h2></div><span>${records.length} 条</span></div>
+    ${entries ? `<ol class="project-review-list">${entries}</ol>` : '<p class="record-output-empty">还没有审阅记录。可在创作流程中对当前脚本、分镜、镜头片段或最终视频提交意见。</p>'}
+  </section>`;
+}
+
+async function hydrateReviewData() {
+  if (state.reviewHydrating || !state.project || state.project.review_targets) return;
+  const projectId = state.project.id;
+  const updatedAt = state.project.updated_at;
+  let retryForCurrentProject = false;
+  state.reviewHydrating = true;
+  try {
+    const fresh = await api(`/api/projects/${encodeURIComponent(projectId)}`);
+    if (state.project?.id !== projectId || state.project.updated_at !== updatedAt) {
+      retryForCurrentProject = Boolean(state.project?.mode === "workflow" && !state.project.review_targets);
+      return;
+    }
+    state.project.review_targets = fresh.review_targets || {};
+    state.project.review_records = fresh.review_records || [];
+    if (state.viewMode === "record-detail") renderProductionRecordDetail(state.project);
+    else if (state.viewMode === "workflow") renderProject();
+  } catch (error) {
+    console.warn("Unable to load project review history", error);
+    const projectChanged = state.project?.id !== projectId || state.project.updated_at !== updatedAt;
+    retryForCurrentProject = Boolean(projectChanged && state.project?.mode === "workflow" && !state.project.review_targets);
+    if (state.project?.id === projectId) showNotice("审阅历史加载失败；可重新打开项目后重试。", true);
+  } finally {
+    state.reviewHydrating = false;
+    if (retryForCurrentProject) queueMicrotask(hydrateReviewData);
+  }
+}
+
+async function submitProjectReview(event) {
+  event.preventDefault();
+  if (!state.project) return;
+  const form = event.currentTarget;
+  const projectId = state.project.id;
+  const button = form.querySelector('button[type="submit"]');
+  const payload = {
+    target_type: form.dataset.reviewTargetType,
+    target_id: form.dataset.reviewTargetId || "",
+    target_revision: form.elements.target_revision.value,
+    decision: form.elements.decision.value,
+    category: form.elements.category.value,
+    note: form.elements.note.value,
+    timecode: form.elements.timecode?.value.trim() || null,
+  };
+  if (payload.decision !== "approved" && !payload.note.trim()) {
+    showNotice("请填写审阅意见或修改要求。", true);
+    form.elements.note.focus();
+    return;
+  }
+  if (button) { button.disabled = true; button.textContent = "正在保存…"; }
+  try {
+    const updatedProject = await api(`/api/projects/${encodeURIComponent(projectId)}/reviews`, {
+      method: "POST", body: JSON.stringify(payload),
+    });
+    if (state.project?.id !== projectId) {
+      showNotice("审阅记录已保存到原项目；当前打开的项目未更改。", false);
+      return;
+    }
+    state.project = updatedProject;
+    showNotice("审阅记录已保存，并绑定到提交时的内容版本。", false);
+    if (state.viewMode === "record-detail") renderProductionRecordDetail(state.project);
+    else renderProject();
+  } catch (error) {
+    showNotice(error.message, true);
+    if (state.project?.id === projectId && (error.message.includes("已更新") || error.message.includes("不可审阅"))) {
+      try {
+        const refreshedProject = await api(`/api/projects/${encodeURIComponent(projectId)}`);
+        if (state.project?.id !== projectId) return;
+        state.project = refreshedProject;
+        if (state.viewMode === "record-detail") renderProductionRecordDetail(state.project);
+        else renderProject();
+      } catch { /* Keep the submitted form available for retry. */ }
+    } else if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = "保存审阅记录";
+    }
+  }
+}
+
+async function ensureCanvasSavedBeforeNavigation() {
+  if (state.viewMode !== "canvas" || !canvasIsDirty()) return true;
+  const saved = await saveStoryboardCanvas();
+  if (saved || !canvasIsDirty()) return true;
+  showNotice("分镜画布尚未保存；请先修复保存问题，或解决并发版本冲突后再离开。", true);
+  return false;
 }
 
 async function openProductionRecord(projectId) {
+  if (!(await ensureCanvasSavedBeforeNavigation())) return;
   try {
     state.project = await api(`/api/projects/${encodeURIComponent(projectId)}`);
     state.viewStage = state.project.active_stage;
@@ -1337,6 +2062,7 @@ async function openProductionRecord(projectId) {
 }
 
 async function showProductionRecords() {
+  if (!(await ensureCanvasSavedBeforeNavigation())) return;
   clearPendingUploads();
   state.project = null;
   state.viewStage = null;
@@ -1358,6 +2084,7 @@ async function refreshSeries() {
 }
 
 async function showSeriesLibrary() {
+  if (!(await ensureCanvasSavedBeforeNavigation())) return;
   clearPendingUploads();
   state.project = null;
   state.viewStage = null;
@@ -1878,6 +2605,7 @@ async function archiveProject(projectId) {
 }
 
 async function showNovelLibrary() {
+  if (!(await ensureCanvasSavedBeforeNavigation())) return;
   try {
     state.novels = await api("/api/novels");
     renderNovelLibrary();
@@ -2092,6 +2820,7 @@ function loadNovelRevision(chapterId, revisionId) {
 }
 
 async function openProject(projectId) {
+  if (!(await ensureCanvasSavedBeforeNavigation())) return;
   try {
     if (state.project?.id !== projectId) clearPendingUploads();
     state.project = await api(`/api/projects/${encodeURIComponent(projectId)}`);
@@ -2192,7 +2921,10 @@ async function generateStage() {
       method: "POST", body: JSON.stringify({ model: modelSelect.value }),
     });
     state.viewStage = stage;
-    showNotice("草稿已生成。审阅或修改后，再确认进入下一步。", false);
+    const validationError = state.project.workflow?.[stage]?.validation_error;
+    showNotice(validationError
+      ? "模型结果未通过镜头任务校验；原始输出已保留，请在编辑框修正并保存。"
+      : "草稿已生成。审阅或修改后，再确认进入下一步。", Boolean(validationError));
     await refreshProjects();
     renderProject();
   } catch (error) {
@@ -2580,8 +3312,21 @@ async function openChat() {
   }
 }
 
-function toggleProjectView() {
+async function toggleProjectView() {
   if (!state.project) return;
+  if (state.viewMode === "canvas") {
+    const saved = await saveStoryboardCanvas();
+    if (!saved && canvasIsDirty()) return;
+    state.viewStage = state.viewStage || state.project.active_stage;
+    renderProject();
+    return;
+  }
+  if (state.viewMode === "production-canvas") {
+    state.viewStage = state.viewStage || state.project.active_stage;
+    renderProject();
+    workspace.querySelector("#stage-title")?.focus();
+    return;
+  }
   if (state.viewMode === "chat") {
     state.viewStage = state.project.active_stage;
     renderProject();
@@ -3217,7 +3962,8 @@ async function initialize() {
     document.querySelector("#open-records")?.addEventListener("click", showProductionRecords);
     document.querySelector("#open-series")?.addEventListener("click", showSeriesLibrary);
     document.querySelector("#open-novels")?.addEventListener("click", showNovelLibrary);
-    document.querySelector("#new-project").addEventListener("click", () => {
+    document.querySelector("#new-project").addEventListener("click", async () => {
+      if (!(await ensureCanvasSavedBeforeNavigation())) return;
       state.activeSeriesAssets = [];
       state.selectedSeriesId = null;
       clearPendingUploads();
@@ -3232,7 +3978,8 @@ async function initialize() {
       renderProjects();
       document.querySelector("#chat-input")?.focus();
     });
-    document.querySelector("#new-workflow").addEventListener("click", () => {
+    document.querySelector("#new-workflow").addEventListener("click", async () => {
+      if (!(await ensureCanvasSavedBeforeNavigation())) return;
       state.activeSeriesAssets = [];
       state.selectedSeriesId = null;
       clearPendingUploads();

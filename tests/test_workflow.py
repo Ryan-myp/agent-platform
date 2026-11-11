@@ -114,10 +114,10 @@ def test_home_page_avoids_stale_markup_and_loads_versioned_assets(tmp_path):
     assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate"
     assert 'id="open-records"' in response.text
     assert 'id="confirm-dialog"' in response.text
-    assert "/static/app.js?v=27" in response.text
-    assert "/static/style.css?v=25" in response.text
+    assert "/static/app.js?v=32" in response.text
+    assert "/static/style.css?v=29" in response.text
 
-    stylesheet = client.get("/static/style.css?v=25")
+    stylesheet = client.get("/static/style.css?v=29")
     assert stylesheet.status_code == 200
     assert "fonts.googleapis.com" not in stylesheet.text
 
@@ -278,6 +278,92 @@ def test_scene_tasks_are_validated_before_save_and_approval(tmp_path):
     assert all(shot["image"]["status"] == "pending" and shot["video"]["status"] == "pending" for shot in shots)
 
 
+def test_scene_plan_parser_extracts_json_from_model_wrappers():
+    from app.services.production import normalize_scene_plan
+
+    payload = {
+        "shots": [{
+            "shot_id": "S01", "duration_seconds": 5,
+            "image_prompt": "A student in a rainy courtyard", "video_prompt": "Slow push in",
+        }],
+        "edit_plan": {},
+    }
+    wrapped = f"生成结果如下：\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```\n完毕。"
+
+    plan = normalize_scene_plan(wrapped)
+
+    assert [shot["shot_id"] for shot in plan["shots"]] == ["S01"]
+    assert plan["edit_plan"]["sequence"] == ["S01"]
+
+
+def test_scene_plan_parser_salvages_complete_shots_when_edit_plan_is_truncated():
+    from app.services.production import normalize_scene_plan
+
+    shots = [{
+        "shot_id": "S01", "duration_seconds": 5,
+        "image_prompt": "A student in a rainy courtyard", "video_prompt": "Slow push in",
+    }]
+    truncated = (
+        '```json\n{"shots":'
+        + json.dumps(shots, ensure_ascii=False)
+        + ',"edit_plan":{"sequence":["S01"],"transitions":"'
+    )
+
+    plan = normalize_scene_plan(truncated)
+
+    assert [shot["shot_id"] for shot in plan["shots"]] == ["S01"]
+    assert plan["edit_plan"]["sequence"] == ["S01"]
+    assert plan["edit_plan"]["transitions"] == ""
+
+
+def test_invalid_scene_model_output_is_preserved_for_editing(tmp_path, monkeypatch):
+    client = make_client(tmp_path)
+    project_id = new_project(client).json()["id"]
+    for stage in ("script", "prompt", "storyboard"):
+        assert client.post(f"/api/projects/{project_id}/generate/{stage}", json={}).status_code == 200
+        assert client.post(f"/api/projects/{project_id}/approve/{stage}").status_code == 200
+
+    raw_output = '{"shots": ['
+    created_profiles = []
+
+    class InvalidSceneProvider:
+        def generate(self, *, system, user):
+            assert "只输出一个完整 JSON 对象" in system
+            return raw_output
+
+    monkeypatch.setattr(
+        "app.services.workflow.create_text_provider",
+        lambda profile, api_key: (created_profiles.append(profile) or InvalidSceneProvider()),
+    )
+    generated = client.post(f"/api/projects/{project_id}/generate/scenes", json={})
+
+    assert generated.status_code == 200
+    item = generated.json()["workflow"]["scenes"]
+    assert item["status"] == "ready"
+    assert item["content"] == raw_output
+    assert created_profiles[0].params["max_tokens"] == 8000
+    assert item["validation_error"]
+    assert client.post(f"/api/projects/{project_id}/approve/scenes").status_code == 422
+
+    valid_plan = {
+        "shots": [{
+            "shot_id": f"S{index:02d}", "duration_seconds": 5,
+            "image_prompt": "A student in a rainy courtyard, warm golden hairpin light",
+            "video_prompt": "Slow push in toward the student",
+        } for index in range(1, 7)],
+        "edit_plan": {},
+    }
+    saved = client.put(
+        f"/api/projects/{project_id}/content/scenes",
+        json={"content": json.dumps(valid_plan, ensure_ascii=False)},
+    )
+    assert saved.status_code == 200
+    assert "validation_error" not in saved.json()["workflow"]["scenes"]
+    approved = client.post(f"/api/projects/{project_id}/approve/scenes")
+    assert approved.status_code == 200
+    assert len(approved.json()["workflow"]["video"]["shots"]) == 6
+
+
 def test_approval_rejects_stage_content_with_explicit_blockers(tmp_path):
     client = make_client(tmp_path)
     project_id = new_project(client).json()["id"]
@@ -340,13 +426,16 @@ def test_empty_scene_plan_error_suggests_reviewing_blocked_upstream_content(tmp_
     )
     response = client.post(f"/api/projects/{project_id}/generate/scenes", json={})
 
-    assert response.status_code == 422
-    assert "shots 为空" in response.json()["detail"]
-    assert "回退补齐信息" in response.json()["detail"]
+    assert response.status_code == 200
+    item = response.json()["workflow"]["scenes"]
+    assert item["status"] == "ready"
+    assert "shots 为空" in item["validation_error"]
+    assert "回退补齐信息" in item["validation_error"]
     project = client.get(f"/api/projects/{project_id}").json()
     assert project["active_stage"] == "scenes"
-    assert project["workflow"]["scenes"]["status"] == "pending"
-    assert project["workflow"]["scenes"]["content"] is None
+    assert project["workflow"]["scenes"]["status"] == "ready"
+    assert project["workflow"]["scenes"]["content"] == json.dumps({"shots": [], "edit_plan": {}})
+    assert project["workflow"]["scenes"]["validation_error"] == item["validation_error"]
 
 
 def test_rollback_reopens_confirmed_stage_and_preserves_stale_asset_history(tmp_path):

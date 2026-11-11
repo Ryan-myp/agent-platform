@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import html
 import json
 import zipfile
 from datetime import datetime, timezone
@@ -11,6 +12,8 @@ from urllib.parse import unquote, urlsplit
 
 from app.providers.media import AssetStore
 from app.services.project_transfer import MAX_BUNDLE_BYTES, MAX_BUNDLE_MEMBERS, MAX_JSON_BYTES
+from app.services.reviews import ReviewService
+from app.services.storyboard_canvas import StoryboardCanvasError, StoryboardCanvasService
 from app.services.video_assembly import VideoAssemblyError, VideoAssemblyService
 from app.stages import STAGES
 from app.store import ProjectStore
@@ -42,7 +45,16 @@ class DeliveryService:
         project = self.store.get(project_id)
         if project is None:
             raise DeliveryPackageError("找不到要打包的创作项目。", status_code=404)
+        raw_canvas = project.get("storyboard_canvas", {})
+        if "storyboard_canvas" in project and project.get("mode") != "workflow":
+            raise DeliveryPackageError("手工分镜画布仅适用于创作流程项目。")
+        try:
+            canvas = StoryboardCanvasService.validate_record(raw_canvas)
+        except StoryboardCanvasError as error:
+            raise DeliveryPackageError("项目中的手工分镜画布无效。") from error
+        canvas_cards = canvas["cards"]
         workflow = project.get("workflow") if isinstance(project.get("workflow"), dict) else {}
+        review_records = ReviewService(self.store).decorate(project).get("review_records", [])
         files: dict[str, bytes] = {}
 
         stage_report = []
@@ -142,14 +154,25 @@ class DeliveryService:
                 "duration_seconds": final_video.get("duration_seconds") if final_is_current else None,
                 "sha256": final_video.get("sha256") if final_is_current else None,
             },
+            "review_count": len(review_records),
+            "current_review_count": sum(bool(item.get("is_current")) for item in review_records),
             "notes": [
                 "此交付包包含创作材料和可找到的本地媒体，不代表内容已通过人工验收。",
                 "如果本地合成视频仍匹配当前镜头与顺序，将以 MP4 一并交付；合成成片仍需人工审核。",
                 "非本地供应商媒体链接不会被下载或写入包内，请在原工作台核对可用性。",
             ],
         }
+        files["manual-storyboard.md"] = self._manual_storyboard_markdown(project, canvas_cards).encode("utf-8")
+        production_report["manual_storyboard"] = {
+            "included": bool(canvas_cards),
+            "shot_count": len(canvas_cards),
+            "duration_seconds": sum(card["duration_seconds"] for card in canvas_cards),
+            "updated_at": canvas["updated_at"],
+        }
         files["production-report.json"] = self._json_bytes(production_report)
-        files["README.md"] = self._readme(project, stage_report, video_shots, media_report).encode("utf-8")
+        files["review-history.json"] = self._json_bytes(review_records)
+        files["05-review-history.md"] = self._review_markdown(review_records).encode("utf-8")
+        files["README.md"] = self._readme(project, stage_report, video_shots, media_report, len(review_records)).encode("utf-8")
 
         if len(files) + len(media_paths) > MAX_BUNDLE_MEMBERS:
             raise DeliveryPackageError("交付包文件数量超过限制。", status_code=413)
@@ -290,7 +313,63 @@ class DeliveryService:
         return str(value or "未设置").replace("\r", " ").replace("\n", " ").replace("|", "\\|")
 
     @staticmethod
-    def _readme(project: dict[str, Any], stages: list[dict[str, Any]], shots: list[Any], media: list[dict[str, Any]]) -> str:
+    def _escape_manual_markdown(value: Any) -> str:
+        text = html.escape(str(value or "").replace("\r\n", "\n").replace("\r", "\n"), quote=False)
+        return text.translate(str.maketrans({
+            "\\": r"\\", "`": r"\`", "*": r"\*", "_": r"\_", "{": r"\{", "}": r"\}",
+            "[": r"\[", "]": r"\]", "(": r"\(", ")": r"\)", "#": r"\#", "+": r"\+",
+            "-": r"\-", ".": r"\.", "!": r"\!", "|": r"\|", "~": r"\~",
+        }))
+
+    def _manual_storyboard_markdown(self, project: dict[str, Any], cards: list[dict[str, Any]]) -> str:
+        title = self._escape_manual_markdown(project.get("title") or "未命名项目")
+        if not cards:
+            return f"# {title} · 手工分镜\n\n尚未创建手工分镜卡片。\n"
+        duration = sum(card["duration_seconds"] for card in cards)
+        lines = [f"# {title} · 手工分镜", "", f"> {len(cards)} 个镜头 · 预计 {duration} 秒 · 手工编排，不调用模型", ""]
+        labels = [
+            ("叙事目的", "purpose"), ("画面描述", "visual_description"), ("镜头 / 运镜", "camera"),
+            ("对白 / 旁白", "voiceover"), ("屏幕文字", "screen_text"), ("转场", "transition"),
+            ("连续性备注", "continuity"),
+        ]
+        for index, card in enumerate(cards, start=1):
+            shot_id = self._escape_manual_markdown(card["shot_id"] or f"S{index:02d}")
+            shot_title = self._escape_manual_markdown(card["title"] or "未命名镜头")
+            lines.extend([f"## {index:02d} · {shot_id} · {shot_title}", "", f"- 时长：{card['duration_seconds']} 秒"])
+            for label, key in labels:
+                value = self._escape_manual_markdown(card.get(key, "").strip())
+                if value:
+                    lines.extend([f"- {label}：", ""])
+                    lines.extend(f"> {line}" if line else ">" for line in value.split("\n"))
+                    lines.append("")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _review_markdown(self, records: list[dict[str, Any]]) -> str:
+        if not records:
+            return "# 审阅历史\n\n尚无审阅记录。\n"
+        decisions = {"approved": "通过", "revision_requested": "需修改", "comment": "意见"}
+        categories = {"general": "综合", "story": "故事", "continuity": "连续性", "visual": "画面", "audio": "声音", "editing": "剪辑", "subtitle": "字幕", "technical": "技术", "other": "其他"}
+        lines = ["# 审阅历史", "", "审阅记录按提交时间倒序排列；“历史版本”表示意见针对的内容或媒体已更新。", ""]
+        for index, record in enumerate(records, start=1):
+            current = "当前版本" if record.get("is_current") else "历史版本"
+            lines.extend([
+                f"## 审阅 {index}", "",
+                f"- 目标：{self._markdown_text(record.get('target_label'))}",
+                f"- 结论：{decisions.get(str(record.get('decision')), '意见')} · {categories.get(str(record.get('category')), '综合')}",
+                f"- 版本状态：{current}",
+                f"- 时间：{self._markdown_text(record.get('created_at'))}",
+            ])
+            if record.get("timecode"):
+                lines.append(f"- 时间码：{self._markdown_text(record.get('timecode'))}")
+            note = self._markdown_text(record.get("note"))
+            if note:
+                lines.extend(["", "意见：", "", note])
+            lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _readme(project: dict[str, Any], stages: list[dict[str, Any]], shots: list[Any], media: list[dict[str, Any]], review_count: int) -> str:
         title = DeliveryService._markdown_text(project.get("title") or "未命名项目")
         brief = project.get("brief") if isinstance(project.get("brief"), dict) else {}
         track = "短剧 / 漫剧" if project.get("track") == "drama" else "品牌营销视频"
@@ -316,12 +395,14 @@ class DeliveryService:
             "- `02-visual-guide.md`：视觉设定\n"
             "- `03-storyboard.md`：分镜\n"
             "- `04-shot-plan.json` 或 `04-shot-plan.md`：逐镜任务与剪辑方案\n"
+            "- `manual-storyboard.md`：无需模型的手工分镜卡片（如已创建）\n"
             "- `production-report.json`：机器可读的制作状态摘要\n"
+            "- `05-review-history.md` / `review-history.json`：绑定内容版本的审阅历史\n"
             "- `media/`：工作台本地保存且被项目引用的图片 / 视频；如有当前有效的本地合成视频，也会包含最终 MP4\n\n"
             "## 步骤状态\n\n"
             "| 步骤 | 状态 | 内容 |\n|---|---|---|\n"
             f"{stage_rows}\n\n"
-            f"已记录视频片段：{videos} 个；打包的本地媒体文件：{local_media} 个；未下载的远程媒体引用：{external_media} 个。\n\n"
+            f"已记录视频片段：{videos} 个；审阅记录：{review_count} 条；打包的本地媒体文件：{local_media} 个；未下载的远程媒体引用：{external_media} 个。\n\n"
             "## 验收提示\n\n"
             "本包是创作交接材料，不等同于已验收成片。请人工确认所有脚本与镜头；本地合成 MP4 也需人工审核。"
             "远程供应商媒体不会被下载，且原链接可能过期；请在工作台核对。项目副本导入 / 备份请使用“导出项目副本”，不要把本交付包当作可恢复备份。\n"
